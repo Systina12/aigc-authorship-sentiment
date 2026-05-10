@@ -94,6 +94,41 @@ def test_load_xiaohongshu_aigc_csv(tmp_path):
     ]
 
 
+def test_load_standard_comment_record_csv_file(tmp_path):
+    csv_path = tmp_path / "comments_cleaned.csv"
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=["username", "gender", "content", "comment_time", "likes", "ip_location", "signature", "feature"],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "username": "Alice",
+                "gender": "保密",
+                "content": "AI 工具能提高效率",
+                "comment_time": "2026-05-10 10:00:00",
+                "likes": "12",
+                "ip_location": "上海",
+                "signature": "",
+                "feature": "aigc",
+            }
+        )
+
+    assert load_data(csv_path) == [
+        CommentRecord(
+            username="Alice",
+            gender="保密",
+            content="AI 工具能提高效率",
+            comment_time="2026-05-10 10:00:00",
+            likes=12,
+            ip_location="上海",
+            signature="",
+            feature="aigc",
+        )
+    ]
+
+
 def test_unrecognized_schema_raises(tmp_path):
     data_dir = tmp_path / "data"
     data_dir.mkdir()

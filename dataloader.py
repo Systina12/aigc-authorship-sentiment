@@ -107,19 +107,54 @@ class XiaohongshuAIGCParser:
         return records
 
 
+class CommentRecordCSVParser:
+    database_name = "CommentRecordCSV"
+
+    _required_fields = {"username", "gender", "content", "comment_time", "likes", "ip_location", "signature"}
+
+    def matches(self, fieldnames: set[str]) -> bool:
+        return self._required_fields.issubset(fieldnames)
+
+    def parse(self, file_path: Path) -> list[CommentRecord]:
+        records: list[CommentRecord] = []
+
+        with _open_csv(file_path) as csv_file:
+            reader = csv.DictReader(csv_file)
+            for row in reader:
+                records.append(
+                    CommentRecord(
+                        username=row["username"],
+                        gender=row["gender"],
+                        content=row["content"],
+                        comment_time=row["comment_time"],
+                        likes=_parse_int(row["likes"], field_name="likes", file_path=file_path),
+                        ip_location=row["ip_location"],
+                        signature=row["signature"],
+                        feature=row.get("feature", ""),
+                    )
+                )
+
+        return records
+
+
 class DataLoader:
     def __init__(self, parsers: Iterable[DataParser] | None = None) -> None:
-        self._parsers = list(parsers or [BilibiliCommentScrapeParser(), XiaohongshuAIGCParser()])
+        self._parsers = list(
+            parsers or [BilibiliCommentScrapeParser(), XiaohongshuAIGCParser(), CommentRecordCSVParser()]
+        )
 
-    def load(self, folder: str | Path) -> list[CommentRecord]:
-        folder_path = Path(folder)
-        if not folder_path.exists():
-            raise FileNotFoundError(f"Data folder does not exist: {folder_path}")
-        if not folder_path.is_dir():
-            raise NotADirectoryError(f"Data path is not a folder: {folder_path}")
+    def load(self, path: str | Path) -> list[CommentRecord]:
+        data_path = Path(path)
+        if not data_path.exists():
+            raise FileNotFoundError(f"Data path does not exist: {data_path}")
+        if data_path.is_file():
+            parser = self._find_parser(data_path)
+            return parser.parse(data_path)
+        if not data_path.is_dir():
+            raise NotADirectoryError(f"Data path is not a folder or file: {data_path}")
 
         records: list[CommentRecord] = []
-        for file_path in sorted(path for path in folder_path.rglob("*") if path.is_file()):
+        for file_path in sorted(path for path in data_path.rglob("*") if path.is_file()):
             parser = self._find_parser(file_path)
             records.extend(parser.parse(file_path))
 
