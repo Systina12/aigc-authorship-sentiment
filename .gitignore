@@ -3,3 +3,4 @@ __pycache__/
 .pytest_tmp/
 *.py[cod]
 data/
+config/content_analysis_config.json

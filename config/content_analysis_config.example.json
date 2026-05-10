@@ -1,6 +1,6 @@
 {
   "base_url": "https://api.deepseek.com",
-  "api_key": "sk-23272a5e990b433bbf01fbba20a81389",
+  "api_key": "",
   "model": "deepseek-v4-pro",
   "reasoning_effort": "max",
   "response_format_type": "json_object"
