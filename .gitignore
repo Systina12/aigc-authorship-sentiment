@@ -1,6 +1,9 @@
 __pycache__/
 .pytest_cache/
 .pytest_tmp/
+.idea/
 *.py[cod]
+.venv/
+.uv-cache/
 data/
 config/content_analysis_config.json
