@@ -19,9 +19,13 @@ def test_run_full_analysis_orchestrates_all_stages(monkeypatch, tmp_path):
     topic_dir = tmp_path / "topic"
     cooccurrence_dir = tmp_path / "cooccurrence"
     report_dir = tmp_path / "report"
+    state_file = tmp_path / "state.json"
 
     def fake_run_pipeline(**kwargs):
         calls.append(("pipeline", kwargs))
+        write_file(deduplicated_file)
+        write_file(cleaned_file)
+        write_file(flagged_file)
         return PipelineOutputs(
             deduplicated_file=deduplicated_file,
             cleaned_file=cleaned_file,
@@ -30,27 +34,40 @@ def test_run_full_analysis_orchestrates_all_stages(monkeypatch, tmp_path):
 
     def fake_analyze_content(**kwargs):
         calls.append(("content", kwargs))
+        write_file(content_dir / "comment_labels.jsonl")
         return SimpleNamespace(output_file=content_dir / "comment_labels.jsonl")
 
     def fake_analyze_sentiment(**kwargs):
         calls.append(("sentiment", kwargs))
+        write_file(sentiment_dir / "comment_sentiment.jsonl")
         return SimpleNamespace(output_file=sentiment_dir / "comment_sentiment.jsonl")
 
     def fake_cluster_topics(**kwargs):
         calls.append(("topic", kwargs))
+        write_file(topic_dir / "comment_topics.csv")
+        write_file(topic_dir / "topic_info.csv")
+        write_file(topic_dir / "topic_representative_docs.jsonl")
+        write_file(topic_dir / "run_metadata.json")
         return SimpleNamespace(
             outputs=SimpleNamespace(
                 comment_topics_file=topic_dir / "comment_topics.csv",
                 topic_info_file=topic_dir / "topic_info.csv",
+                representative_docs_file=topic_dir / "topic_representative_docs.jsonl",
+                metadata_file=topic_dir / "run_metadata.json",
+                model_dir=None,
             )
         )
 
     def fake_analyze_cooccurrence(**kwargs):
         calls.append(("cooccurrence", kwargs))
+        write_file(cooccurrence_dir / "summary.json")
         return SimpleNamespace(outputs=SimpleNamespace(summary_file=cooccurrence_dir / "summary.json"))
 
     def fake_build_analysis_report(**kwargs):
         calls.append(("report", kwargs))
+        write_file(report_dir / "report.html")
+        write_file(report_dir / "interactive_report.html")
+        write_file(report_dir / "report_metadata.json")
         return SimpleNamespace(
             static_html=report_dir / "report.html",
             interactive_html=report_dir / "interactive_report.html",
@@ -72,6 +89,7 @@ def test_run_full_analysis_orchestrates_all_stages(monkeypatch, tmp_path):
         topic_output_dir=topic_dir,
         cooccurrence_output_dir=cooccurrence_dir,
         report_output_dir=report_dir,
+        state_file=state_file,
         limit=5,
         overwrite_llm=True,
         min_confidence=0.7,
@@ -146,7 +164,7 @@ def test_run_full_analysis_skip_flags_use_expected_outputs(monkeypatch, tmp_path
 
     monkeypatch.setattr(
         "scripts.run_full_analysis.run_pipeline",
-        lambda **kwargs: PipelineOutputs(
+        lambda **kwargs: pipeline_outputs_with_files(
             deduplicated_file=tmp_path / "deduplicated" / "comments_deduplicated.csv",
             cleaned_file=cleaned_file,
             flagged_file=tmp_path / "cleaned" / "rejected_or_flagged_comments.csv",
@@ -165,6 +183,7 @@ def test_run_full_analysis_skip_flags_use_expected_outputs(monkeypatch, tmp_path
         topic_output_dir=tmp_path / "topic",
         cooccurrence_output_dir=tmp_path / "cooccurrence",
         report_output_dir=tmp_path / "report",
+        state_file=tmp_path / "state.json",
         skip_content=True,
         skip_sentiment=True,
         skip_topic=True,
@@ -185,6 +204,150 @@ def test_run_full_analysis_skip_flags_use_expected_outputs(monkeypatch, tmp_path
 def test_run_full_analysis_validates_limit():
     with pytest.raises(ValueError, match="limit"):
         run_full_analysis(limit=-1)
+
+
+def test_run_full_analysis_resume_skips_completed_stage_outputs(monkeypatch, tmp_path):
+    calls = []
+    raw_dir = tmp_path / "raw"
+    cleaned_file = tmp_path / "cleaned" / "comments_cleaned.csv"
+    deduplicated_file = tmp_path / "deduplicated" / "comments_deduplicated.csv"
+    flagged_file = tmp_path / "cleaned" / "rejected_or_flagged_comments.csv"
+    content_dir = tmp_path / "content"
+    sentiment_dir = tmp_path / "sentiment"
+    topic_dir = tmp_path / "topic"
+    cooccurrence_dir = tmp_path / "cooccurrence"
+    report_dir = tmp_path / "report"
+    state_file = tmp_path / "state.json"
+
+    def fake_run_pipeline(**kwargs):
+        calls.append("pipeline")
+        return pipeline_outputs_with_files(
+            deduplicated_file=deduplicated_file,
+            cleaned_file=cleaned_file,
+            flagged_file=flagged_file,
+        )
+
+    def fake_analyze_content(**kwargs):
+        calls.append("content")
+        write_file(content_dir / "comment_labels.jsonl")
+        return SimpleNamespace(output_file=content_dir / "comment_labels.jsonl")
+
+    def fake_analyze_sentiment(**kwargs):
+        calls.append("sentiment")
+        write_file(sentiment_dir / "comment_sentiment.jsonl")
+        return SimpleNamespace(output_file=sentiment_dir / "comment_sentiment.jsonl")
+
+    def fake_cluster_topics(**kwargs):
+        calls.append("topic")
+        write_file(topic_dir / "comment_topics.csv")
+        write_file(topic_dir / "topic_info.csv")
+        write_file(topic_dir / "topic_representative_docs.jsonl")
+        write_file(topic_dir / "run_metadata.json")
+        return SimpleNamespace(
+            outputs=SimpleNamespace(
+                comment_topics_file=topic_dir / "comment_topics.csv",
+                topic_info_file=topic_dir / "topic_info.csv",
+                representative_docs_file=topic_dir / "topic_representative_docs.jsonl",
+                metadata_file=topic_dir / "run_metadata.json",
+                model_dir=None,
+            )
+        )
+
+    def fake_analyze_cooccurrence(**kwargs):
+        calls.append("cooccurrence")
+        write_file(cooccurrence_dir / "summary.json")
+        return SimpleNamespace(outputs=SimpleNamespace(summary_file=cooccurrence_dir / "summary.json"))
+
+    def fake_build_analysis_report(**kwargs):
+        calls.append("report")
+        write_file(report_dir / "report.html")
+        write_file(report_dir / "interactive_report.html")
+        write_file(report_dir / "report_metadata.json")
+        return SimpleNamespace(
+            static_html=report_dir / "report.html",
+            interactive_html=report_dir / "interactive_report.html",
+            metadata_file=report_dir / "report_metadata.json",
+        )
+
+    monkeypatch.setattr("scripts.run_full_analysis.run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr("scripts.run_full_analysis.analyze_content", fake_analyze_content)
+    monkeypatch.setattr("scripts.run_full_analysis.analyze_sentiment", fake_analyze_sentiment)
+    monkeypatch.setattr("scripts.run_full_analysis.cluster_topics", fake_cluster_topics)
+    monkeypatch.setattr("scripts.run_full_analysis.analyze_cooccurrence", fake_analyze_cooccurrence)
+    monkeypatch.setattr("scripts.run_full_analysis.build_analysis_report", fake_build_analysis_report)
+
+    kwargs = {
+        "raw_data_dir": raw_dir,
+        "content_output_dir": content_dir,
+        "sentiment_output_dir": sentiment_dir,
+        "topic_output_dir": topic_dir,
+        "cooccurrence_output_dir": cooccurrence_dir,
+        "report_output_dir": report_dir,
+        "state_file": state_file,
+        "limit": 3,
+    }
+    run_full_analysis(**kwargs)
+    run_full_analysis(**kwargs)
+
+    assert calls == ["pipeline", "content", "sentiment", "topic", "cooccurrence", "report"]
+
+
+def test_run_full_analysis_retries_llm_stage_until_error_free(monkeypatch, tmp_path):
+    calls = []
+    raw_dir = tmp_path / "raw"
+    cleaned_file = tmp_path / "cleaned" / "comments_cleaned.csv"
+    content_dir = tmp_path / "content"
+    state_file = tmp_path / "state.json"
+
+    monkeypatch.setattr(
+        "scripts.run_full_analysis.run_pipeline",
+        lambda **kwargs: pipeline_outputs_with_files(
+            deduplicated_file=tmp_path / "deduplicated" / "comments_deduplicated.csv",
+            cleaned_file=cleaned_file,
+            flagged_file=tmp_path / "cleaned" / "rejected_or_flagged_comments.csv",
+        ),
+    )
+
+    def fake_analyze_content(**kwargs):
+        calls.append("content")
+        write_file(content_dir / "comment_labels.jsonl")
+        return SimpleNamespace(output_file=content_dir / "comment_labels.jsonl", error_records=1)
+
+    monkeypatch.setattr("scripts.run_full_analysis.analyze_content", fake_analyze_content)
+    monkeypatch.setattr("scripts.run_full_analysis.analyze_sentiment", fail_if_called)
+    monkeypatch.setattr("scripts.run_full_analysis.cluster_topics", fail_if_called)
+    monkeypatch.setattr("scripts.run_full_analysis.analyze_cooccurrence", fail_if_called)
+    monkeypatch.setattr("scripts.run_full_analysis.build_analysis_report", fail_if_called)
+
+    kwargs = {
+        "raw_data_dir": raw_dir,
+        "content_output_dir": content_dir,
+        "state_file": state_file,
+        "skip_sentiment": True,
+        "skip_topic": True,
+        "skip_cooccurrence": True,
+        "skip_report": True,
+    }
+    run_full_analysis(**kwargs)
+    run_full_analysis(**kwargs)
+
+    assert calls == ["content", "content"]
+
+
+def pipeline_outputs_with_files(*, deduplicated_file: Path, cleaned_file: Path, flagged_file: Path) -> PipelineOutputs:
+    write_file(deduplicated_file)
+    write_file(cleaned_file)
+    write_file(flagged_file)
+    return PipelineOutputs(
+        deduplicated_file=deduplicated_file,
+        cleaned_file=cleaned_file,
+        flagged_file=flagged_file,
+    )
+
+
+def write_file(path: Path, content: str = "ok") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
 
 
 def fail_if_called(**kwargs):

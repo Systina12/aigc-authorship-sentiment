@@ -164,7 +164,7 @@ def load_config(config_file: str | Path) -> LLMConfig:
     if not config_path.exists():
         raise FileNotFoundError(f"LLM config file does not exist: {config_path}")
 
-    with config_path.open("r", encoding="utf-8") as config_stream:
+    with config_path.open("r", encoding="utf-8-sig") as config_stream:
         config = json.load(config_stream)
     if not isinstance(config, dict):
         raise ValueError(f"LLM config must be a JSON object: {config_path}")
