@@ -1,5 +1,6 @@
 import csv
 import json
+import threading
 
 import pytest
 
@@ -378,6 +379,57 @@ def test_analyze_content_supports_responses_api_output_text(tmp_path, monkeypatc
     assert posted_payloads[0]["reasoning"] == {"effort": REASONING_EFFORT}
     assert posted_payloads[0]["text"]["format"] == {"type": RESPONSE_FORMAT_TYPE}
     assert rows[0]["status"] == "ok"
+
+
+def test_analyze_content_uses_configured_max_workers(tmp_path, monkeypatch):
+    input_file = tmp_path / "comments_cleaned.csv"
+    output_file = tmp_path / "comment_labels.jsonl"
+    config_file = write_config(tmp_path, max_workers=2)
+    write_comment_csv(input_file, ["first concurrent row", "second concurrent row"])
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active_requests = 0
+    max_active_requests = 0
+
+    def fake_post(url, headers, json, timeout):
+        nonlocal active_requests, max_active_requests
+        with lock:
+            active_requests += 1
+            max_active_requests = max(max_active_requests, active_requests)
+        try:
+            barrier.wait(timeout=2)
+        finally:
+            with lock:
+                active_requests -= 1
+        return FakeResponse(success_response())
+
+    monkeypatch.setattr(content_analysis.requests, "post", fake_post)
+
+    report = content_analysis.analyze_content(
+        input_file=input_file,
+        output_file=output_file,
+        config_file=config_file,
+    )
+
+    rows = read_jsonl(output_file)
+
+    assert report.written_records == 2
+    assert report.error_records == 0
+    assert max_active_requests == 2
+    assert sorted(row["record_index"] for row in rows) == [0, 1]
+    assert all(row["status"] == "ok" for row in rows)
+
+
+def test_analyze_content_requires_positive_max_workers(tmp_path):
+    input_file = tmp_path / "comments_cleaned.csv"
+    output_file = tmp_path / "comment_labels.jsonl"
+    config_file = write_config(tmp_path, max_workers=0)
+    write_comment_csv(input_file, ["won't run"])
+
+    with pytest.raises(ValueError, match="max_workers"):
+        content_analysis.analyze_content(input_file=input_file, output_file=output_file, config_file=config_file)
+
+    assert not output_file.exists()
 
 
 def test_extract_responses_content_supports_nested_output_text():

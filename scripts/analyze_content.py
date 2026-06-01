@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -99,6 +100,7 @@ class LLMConfig:
     reasoning_effort: str = ""
     response_format_type: str = "json_object"
     api_type: str = CHAT_COMPLETIONS_API_TYPE
+    max_workers: int = 1
 
 
 @dataclass(frozen=True)
@@ -132,26 +134,25 @@ def analyze_content(
     records = DataLoader().load(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    pending_records: list[tuple[int, CommentRecord, str]] = []
     written_records = 0
     skipped_records = 0
     error_records = 0
+    for record_index, record in enumerate(records):
+        if limit is not None and record_index >= limit:
+            break
+
+        current_record_hash = record_hash(record)
+        if current_record_hash in successful_records.get(record_index, set()):
+            skipped_records += 1
+            continue
+
+        pending_records.append((record_index, record, current_record_hash))
+
     with output_path.open("a", encoding="utf-8", newline="\n") as output_stream:
-        for record_index, record in enumerate(records):
-            if limit is not None and record_index >= limit:
-                break
-
-            current_record_hash = record_hash(record)
-            if current_record_hash in successful_records.get(record_index, set()):
-                skipped_records += 1
-                continue
-
-            try:
-                analysis = analyze_record(record, llm_config)
-                output_row = build_success_row(record_index, record, current_record_hash, analysis, llm_config.model)
-            except Exception as exc:  # noqa: BLE001 - batch jobs must preserve per-record failures.
+        for output_row, is_error in iter_content_analysis_rows(pending_records, llm_config):
+            if is_error:
                 error_records += 1
-                output_row = build_error_row(record_index, record, current_record_hash, exc, llm_config.model)
-
             output_stream.write(json.dumps(output_row, ensure_ascii=False) + "\n")
             output_stream.flush()
             written_records += 1
@@ -182,6 +183,7 @@ def load_config(config_file: str | Path) -> LLMConfig:
         reasoning_effort=str(config.get("reasoning_effort", "")),
         response_format_type=str(config.get("response_format_type", "json_object")),
         api_type=str(config.get("api_type", config.get("endpoint_type", CHAT_COMPLETIONS_API_TYPE))),
+        max_workers=parse_max_workers(config, config_path=config_path),
     )
     validate_configuration(llm_config, config_path=config_path)
     return llm_config
@@ -200,6 +202,28 @@ def validate_configuration(config: LLMConfig, *, config_path: Path) -> None:
             f"LLM config has unsupported api_type in {config_path}: {config.api_type!r}. "
             f"Use {CHAT_COMPLETIONS_API_TYPE!r} or {RESPONSES_API_TYPE!r}."
         )
+    if config.max_workers < 1:
+        raise ValueError(f"LLM config has invalid max_workers in {config_path}: {config.max_workers!r}")
+
+
+def parse_max_workers(config: dict[str, Any], *, config_path: Path) -> int:
+    raw_value = None
+    for key in ("max_workers", "thread_count", "threads"):
+        if key in config:
+            raw_value = config.get(key)
+            break
+
+    if raw_value in (None, ""):
+        return 1
+    if isinstance(raw_value, bool):
+        raise ValueError(f"LLM config has invalid max_workers in {config_path}: {raw_value!r}")
+    try:
+        max_workers = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"LLM config has invalid max_workers in {config_path}: {raw_value!r}") from exc
+    if max_workers < 1:
+        raise ValueError(f"LLM config has invalid max_workers in {config_path}: {raw_value!r}")
+    return max_workers
 
 
 def resolve_output_file(output_file: str | Path | None, output_dir: str | Path | None) -> Path:
@@ -258,6 +282,40 @@ def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:
         raise ValueError("LLM response content is not a string")
 
     return normalize_analysis(json.loads(content))
+
+
+def iter_content_analysis_rows(
+    pending_records: list[tuple[int, CommentRecord, str]],
+    config: LLMConfig,
+):
+    if not pending_records:
+        return
+
+    if config.max_workers == 1:
+        for record_index, record, record_hash_value in pending_records:
+            yield analyze_content_row(record_index, record, record_hash_value, config)
+        return
+
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+        futures = [
+            executor.submit(analyze_content_row, record_index, record, record_hash_value, config)
+            for record_index, record, record_hash_value in pending_records
+        ]
+        for future in as_completed(futures):
+            yield future.result()
+
+
+def analyze_content_row(
+    record_index: int,
+    record: CommentRecord,
+    record_hash_value: str,
+    config: LLMConfig,
+) -> tuple[dict[str, Any], bool]:
+    try:
+        analysis = analyze_record(record, config)
+        return build_success_row(record_index, record, record_hash_value, analysis, config.model), False
+    except Exception as exc:  # noqa: BLE001 - batch jobs must preserve per-record failures.
+        return build_error_row(record_index, record, record_hash_value, exc, config.model), True
 
 
 def chat_completions_url(base_url: str) -> str:

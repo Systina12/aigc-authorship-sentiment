@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -130,26 +131,25 @@ def analyze_sentiment(
     records = DataLoader().load(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    pending_records: list[tuple[int, CommentRecord, str]] = []
     written_records = 0
     skipped_records = 0
     error_records = 0
+    for record_index, record in enumerate(records):
+        if limit is not None and record_index >= limit:
+            break
+
+        current_record_hash = record_hash(record)
+        if current_record_hash in successful_records.get(record_index, set()):
+            skipped_records += 1
+            continue
+
+        pending_records.append((record_index, record, current_record_hash))
+
     with output_path.open("a", encoding="utf-8", newline="\n") as output_stream:
-        for record_index, record in enumerate(records):
-            if limit is not None and record_index >= limit:
-                break
-
-            current_record_hash = record_hash(record)
-            if current_record_hash in successful_records.get(record_index, set()):
-                skipped_records += 1
-                continue
-
-            try:
-                sentiment = analyze_record(record, llm_config)
-                output_row = build_success_row(record_index, record, current_record_hash, sentiment, llm_config.model)
-            except Exception as exc:  # noqa: BLE001 - batch jobs must preserve per-record failures.
+        for output_row, is_error in iter_sentiment_analysis_rows(pending_records, llm_config):
+            if is_error:
                 error_records += 1
-                output_row = build_error_row(record_index, record, current_record_hash, exc, llm_config.model)
-
             output_stream.write(json.dumps(output_row, ensure_ascii=False) + "\n")
             output_stream.flush()
             written_records += 1
@@ -192,6 +192,40 @@ def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:
         raise ValueError("LLM response content is not a string")
 
     return normalize_sentiment(json.loads(content))
+
+
+def iter_sentiment_analysis_rows(
+    pending_records: list[tuple[int, CommentRecord, str]],
+    config: LLMConfig,
+):
+    if not pending_records:
+        return
+
+    if config.max_workers == 1:
+        for record_index, record, record_hash_value in pending_records:
+            yield analyze_sentiment_row(record_index, record, record_hash_value, config)
+        return
+
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+        futures = [
+            executor.submit(analyze_sentiment_row, record_index, record, record_hash_value, config)
+            for record_index, record, record_hash_value in pending_records
+        ]
+        for future in as_completed(futures):
+            yield future.result()
+
+
+def analyze_sentiment_row(
+    record_index: int,
+    record: CommentRecord,
+    record_hash_value: str,
+    config: LLMConfig,
+) -> tuple[dict[str, Any], bool]:
+    try:
+        sentiment = analyze_record(record, config)
+        return build_success_row(record_index, record, record_hash_value, sentiment, config.model), False
+    except Exception as exc:  # noqa: BLE001 - batch jobs must preserve per-record failures.
+        return build_error_row(record_index, record, record_hash_value, exc, config.model), True
 
 
 def build_request_payload(

@@ -144,6 +144,7 @@ def override_config(
             response_format_type if response_format_type is not None else config.response_format_type
         ),
         api_type=api_type if api_type is not None else config.api_type,
+        max_workers=config.max_workers,
     )
 
 
