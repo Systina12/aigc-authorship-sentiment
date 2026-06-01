@@ -3,7 +3,11 @@ import json
 
 import pytest
 
+from scripts.analyze_content import record_dict_hash
 from scripts.build_analysis_report import build_analysis_report
+
+
+LAST_CLEANED_HASHES_BY_INDEX = {}
 
 
 def test_build_analysis_report_writes_tables_figures_and_html(tmp_path):
@@ -28,7 +32,7 @@ def test_build_analysis_report_writes_tables_figures_and_html(tmp_path):
             content_row(0, "hash-0", [("技术认可", 0.9), ("工具化认知", 0.85)]),
             content_row(1, "hash-1", [("职业焦虑", 0.95), ("版权争议", 0.5)]),
             content_row(2, "hash-2", [("无法归类/无关讨论", 1.0)]),
-            {"record_index": 3, "record_hash": "hash-3", "status": "error", "analysis": None},
+            {"record_index": 3, "record_hash": LAST_CLEANED_HASHES_BY_INDEX[3], "status": "error", "analysis": None},
         ],
     )
     write_jsonl(
@@ -37,7 +41,7 @@ def test_build_analysis_report_writes_tables_figures_and_html(tmp_path):
             sentiment_row(0, "hash-0", [("乐观", 0.9), ("质疑", 0.4)], dominant="乐观", polarity="positive"),
             sentiment_row(1, "hash-1", [("焦虑", 0.9)], dominant="焦虑", polarity="negative"),
             sentiment_row(2, "hash-2", [("中性/无法判断", 1.0)], dominant="中性/无法判断", polarity="neutral"),
-            {"record_index": 3, "record_hash": "hash-3", "status": "error", "sentiment": None},
+            {"record_index": 3, "record_hash": LAST_CLEANED_HASHES_BY_INDEX[3], "status": "error", "sentiment": None},
         ],
     )
     write_topic_csv(
@@ -152,6 +156,63 @@ def test_build_analysis_report_skips_missing_optional_inputs(tmp_path):
     assert (output_dir / "report.html").exists()
 
 
+def test_build_analysis_report_filters_stale_analysis_rows_and_keeps_latest_ok(tmp_path):
+    cleaned_file = tmp_path / "comments_cleaned.csv"
+    content_file = tmp_path / "comment_labels.jsonl"
+    sentiment_file = tmp_path / "comment_sentiment.jsonl"
+    topic_file = tmp_path / "comment_topics.csv"
+    output_dir = tmp_path / "analysis_report"
+    write_comment_csv(cleaned_file, ["current row"])
+    current_hash = cleaned_record_hash("current row", 0)
+    write_jsonl(
+        content_file,
+        [
+            content_row(99, "stale-hash", [("stale-content", 0.9)]),
+            {"record_index": 0, "record_hash": current_hash, "status": "error", "analysis": None},
+            content_row(0, current_hash, [("old-current-content", 0.9)]),
+            content_row(5, current_hash, [("latest-current-content", 0.9)]),
+        ],
+    )
+    write_jsonl(
+        sentiment_file,
+        [
+            sentiment_row(99, "stale-hash", [("stale-sentiment", 0.9)], dominant="stale-sentiment", polarity="negative"),
+            {"record_index": 0, "record_hash": current_hash, "status": "error", "sentiment": None},
+            sentiment_row(0, current_hash, [("old-current-sentiment", 0.9)], dominant="old-current-sentiment", polarity="negative"),
+            sentiment_row(5, current_hash, [("latest-current-sentiment", 0.9)], dominant="latest-current-sentiment", polarity="positive"),
+        ],
+    )
+    write_topic_csv(topic_file, [{"record_index": "0", "topic": "0", "topic_probability": "0.9"}])
+
+    build_analysis_report(
+        cleaned_file=cleaned_file,
+        content_file=content_file,
+        sentiment_file=sentiment_file,
+        topic_file=topic_file,
+        topic_info_file=tmp_path / "missing_topic_info.csv",
+        output_dir=output_dir,
+    )
+
+    content_summary = read_csv(output_dir / "content_label_summary.csv")
+    sentiment_summary = read_csv(output_dir / "sentiment_label_summary.csv")
+    polarity_summary = read_csv(output_dir / "sentiment_polarity_summary.csv")
+    topic_content = read_csv(output_dir / "topic_content_crosstab.csv")
+    topic_sentiment = read_csv(output_dir / "topic_sentiment_crosstab.csv")
+    metadata = json.loads((output_dir / "report_metadata.json").read_text(encoding="utf-8"))
+
+    assert category_counts(content_summary) == {"latest-current-content": "1"}
+    assert category_counts(sentiment_summary) == {"latest-current-sentiment": "1"}
+    assert count_by_field(polarity_summary, "polarity") == {"positive": "1"}
+    assert row_value(topic_content, "topic", "0", "latest-current-content") == "1"
+    assert row_value(topic_sentiment, "topic", "0", "latest-current-sentiment") == "1"
+    assert metadata["inputs"]["content_file"]["stale_rows"] == 1
+    assert metadata["inputs"]["content_file"]["duplicate_ok_rows"] == 1
+    assert metadata["inputs"]["content_file"]["error_rows"] == 0
+    assert metadata["inputs"]["sentiment_file"]["stale_rows"] == 1
+    assert metadata["inputs"]["sentiment_file"]["duplicate_ok_rows"] == 1
+    assert metadata["inputs"]["sentiment_file"]["error_rows"] == 0
+
+
 def test_build_analysis_report_removes_stale_topic_tables_when_topic_file_is_missing(tmp_path):
     cleaned_file = tmp_path / "comments_cleaned.csv"
     content_file = tmp_path / "comment_labels.jsonl"
@@ -242,6 +303,8 @@ def test_build_analysis_report_validates_parameters(tmp_path):
 
 
 def write_comment_csv(path, contents):
+    global LAST_CLEANED_HASHES_BY_INDEX
+    LAST_CLEANED_HASHES_BY_INDEX = {}
     with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.DictWriter(
             csv_file,
@@ -249,6 +312,7 @@ def write_comment_csv(path, contents):
         )
         writer.writeheader()
         for index, content in enumerate(contents):
+            LAST_CLEANED_HASHES_BY_INDEX[index] = cleaned_record_hash(content, index)
             writer.writerow(
                 {
                     "username": f"user-{index}",
@@ -263,7 +327,23 @@ def write_comment_csv(path, contents):
             )
 
 
+def cleaned_record_hash(content, index):
+    return record_dict_hash(
+        {
+            "username": f"user-{index}",
+            "gender": "",
+            "content": content,
+            "comment_time": "2026-05-10 10:00:00",
+            "likes": 1,
+            "ip_location": "",
+            "signature": "",
+            "feature": "aigc",
+        }
+    )
+
+
 def content_row(record_index, record_hash, labels):
+    record_hash = normalize_fixture_hash(record_index, record_hash)
     return {
         "record_index": record_index,
         "record_hash": record_hash,
@@ -276,6 +356,7 @@ def content_row(record_index, record_hash, labels):
 
 
 def sentiment_row(record_index, record_hash, labels, *, dominant, polarity):
+    record_hash = normalize_fixture_hash(record_index, record_hash)
     return {
         "record_index": record_index,
         "record_hash": record_hash,
@@ -298,6 +379,12 @@ def normalize_labels(labels):
             category, confidence = label, 1.0
         normalized_labels.append({"category": category, "confidence": confidence, "rationale": "test"})
     return normalized_labels
+
+
+def normalize_fixture_hash(record_index, record_hash):
+    if record_hash == f"hash-{record_index}":
+        return LAST_CLEANED_HASHES_BY_INDEX.get(record_index, record_hash)
+    return record_hash
 
 
 def write_topic_csv(path, rows):

@@ -333,6 +333,48 @@ def test_analyze_content_skips_only_matching_success_rows(tmp_path, monkeypatch)
     assert rows[-1]["record"]["content"] == "同一索引但内容变了"
 
 
+def test_analyze_content_skips_matching_success_hash_after_index_shift(tmp_path, monkeypatch):
+    input_file = tmp_path / "comments_cleaned.csv"
+    output_file = tmp_path / "comment_labels.jsonl"
+    config_file = write_config(tmp_path)
+    write_comment_csv(input_file, ["new row", "already ok moved"])
+    moved_record = record_dict("already ok moved")
+    output_file.write_text(
+        json_dumps(
+            {
+                "record_index": 0,
+                "record_hash": content_analysis.record_dict_hash(moved_record),
+                "record": moved_record,
+                "status": "ok",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    posted_payloads = []
+
+    def fake_post(url, headers, json, timeout):
+        posted_payloads.append(json)
+        return FakeResponse(success_response())
+
+    monkeypatch.setattr(content_analysis.requests, "post", fake_post)
+
+    report = content_analysis.analyze_content(
+        input_file=input_file,
+        output_file=output_file,
+        config_file=config_file,
+    )
+
+    rows = read_jsonl(output_file)
+
+    assert report.skipped_records == 1
+    assert report.written_records == 1
+    assert len(posted_payloads) == 1
+    assert posted_payloads[0]["messages"][1]["content"].endswith("new row")
+    assert rows[-1]["record_index"] == 0
+    assert rows[-1]["record"]["content"] == "new row"
+
+
 def test_analyze_content_requires_complete_config(tmp_path):
     input_file = tmp_path / "comments_cleaned.csv"
     output_file = tmp_path / "comment_labels.jsonl"

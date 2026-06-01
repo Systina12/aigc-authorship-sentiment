@@ -243,6 +243,7 @@ def run_full_analysis(
         print(f"Step 5/7: Skipping co-occurrence analysis, using {cooccurrence_summary_file}")
     else:
         cooccurrence_signature = build_cooccurrence_signature(
+            cleaned_file=pipeline_outputs.cleaned_file,
             content_file=content_file,
             sentiment_file=sentiment_file,
             topic_file=topic_file,
@@ -263,6 +264,7 @@ def run_full_analysis(
             cooccurrence_report = analyze_cooccurrence(
                 input_file=content_file,
                 output_dir=cooccurrence_output_dir,
+                cleaned_file=pipeline_outputs.cleaned_file,
                 sentiment_file=sentiment_file,
                 topic_file=topic_file,
                 limit=limit,
@@ -533,6 +535,7 @@ def build_topic_signature(
 
 def build_cooccurrence_signature(
     *,
+    cleaned_file: str | Path,
     content_file: str | Path,
     sentiment_file: str | Path,
     topic_file: str | Path,
@@ -547,6 +550,7 @@ def build_cooccurrence_signature(
     include_topic_noise: bool,
 ) -> dict[str, Any]:
     return {
+        "cleaned_file": path_signature(Path(cleaned_file)),
         "content_file": path_signature(Path(content_file)),
         "sentiment_file": path_signature(Path(sentiment_file)),
         "topic_file": path_signature(Path(topic_file)),

@@ -4,6 +4,7 @@ import json
 import networkx as nx
 import pytest
 
+from scripts.analyze_content import record_dict_hash
 from scripts.analyze_cooccurrence import analyze_cooccurrence
 
 
@@ -277,6 +278,45 @@ def test_analyze_cooccurrence_can_include_content_fallback(tmp_path):
     assert edges == []
 
 
+def test_analyze_cooccurrence_filters_to_current_cleaned_hashes_and_latest_ok(tmp_path):
+    cleaned_file = tmp_path / "comments_cleaned.csv"
+    input_file = tmp_path / "comment_labels.jsonl"
+    topic_file = tmp_path / "comment_topics.csv"
+    output_dir = tmp_path / "cooccurrence"
+    write_comment_csv(cleaned_file, ["current row"])
+    current_hash = cleaned_record_hash("current row", 0)
+    write_jsonl(
+        input_file,
+        [
+            content_row(99, "stale-hash", ["stale-content"]),
+            content_row(0, current_hash, ["old-current-content"]),
+            content_row(5, current_hash, ["latest-current-content"]),
+        ],
+    )
+    write_topic_csv(topic_file, [{"record_index": "0", "topic": "0", "topic_probability": "0.9"}])
+
+    report = analyze_cooccurrence(
+        input_file=input_file,
+        output_dir=output_dir,
+        cleaned_file=cleaned_file,
+        sentiment_file=None,
+        topic_file=topic_file,
+    )
+
+    nodes = read_csv(output_dir / "label_nodes.csv")
+    topic_content_edges = read_csv(output_dir / "topic_content_edges.csv")
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert report.input_rows == 3
+    assert report.ok_rows == 3
+    assert report.used_rows == 1
+    assert node_counts(nodes) == {"latest-current-content": "1"}
+    assert edge_weights(topic_content_edges) == {frozenset(("topic:0", "latest-current-content")): "1"}
+    assert summary["current_cleaned_records"] == 1
+    assert summary["stale_content_rows"] == 1
+    assert summary["duplicate_content_ok_rows"] == 1
+
+
 def test_analyze_cooccurrence_validates_parameters(tmp_path):
     input_file = tmp_path / "comment_labels.jsonl"
     write_jsonl(input_file, [])
@@ -351,6 +391,43 @@ def write_topic_info_csv(path):
         writer.writeheader()
         writer.writerow({"Topic": "0", "Name": "ai_tools", "Keywords": "AI:0.2;工具:0.1"})
         writer.writerow({"Topic": "1", "Name": "copyright", "Keywords": "版权:0.3;训练:0.2"})
+
+
+def write_comment_csv(path, contents):
+    with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=["username", "gender", "content", "comment_time", "likes", "ip_location", "signature", "feature"],
+        )
+        writer.writeheader()
+        for index, content in enumerate(contents):
+            writer.writerow(
+                {
+                    "username": f"user-{index}",
+                    "gender": "",
+                    "content": content,
+                    "comment_time": "2026-05-10 10:00:00",
+                    "likes": "1",
+                    "ip_location": "",
+                    "signature": "",
+                    "feature": "aigc",
+                }
+            )
+
+
+def cleaned_record_hash(content, index):
+    return record_dict_hash(
+        {
+            "username": f"user-{index}",
+            "gender": "",
+            "content": content,
+            "comment_time": "2026-05-10 10:00:00",
+            "likes": 1,
+            "ip_location": "",
+            "signature": "",
+            "feature": "aigc",
+        }
+    )
 
 
 def read_csv(path):

@@ -127,7 +127,7 @@ def analyze_sentiment(
     if overwrite and output_path.exists():
         output_path.unlink()
 
-    successful_records = load_successful_record_hashes(output_path)
+    successful_hashes = load_successful_record_hashes(output_path)
     records = DataLoader().load(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -140,7 +140,7 @@ def analyze_sentiment(
             break
 
         current_record_hash = record_hash(record)
-        if current_record_hash in successful_records.get(record_index, set()):
+        if current_record_hash in successful_hashes:
             skipped_records += 1
             continue
 

@@ -4,6 +4,7 @@ import argparse
 import csv
 import itertools
 import json
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,8 +14,13 @@ from typing import Any, Iterable
 import networkx as nx
 from networkx.algorithms.community import greedy_modularity_communities
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from dataloader import DataLoader
+from scripts.analyze_content import record_dict_hash, record_hash
 
 DEFAULT_INPUT_FILE = Path("data/content_analysis/comment_labels.jsonl")
+DEFAULT_CLEANED_FILE = Path("data/cleaned/comments_cleaned.csv")
 DEFAULT_SENTIMENT_FILE = Path("data/sentiment_analysis/comment_sentiment.jsonl")
 DEFAULT_TOPIC_FILE = Path("data/topic_clustering/comment_topics.csv")
 DEFAULT_OUTPUT_DIR = Path("data/cooccurrence_analysis")
@@ -107,12 +113,15 @@ class JsonlLoadResult:
     input_rows: int
     ok_rows: int
     records: list[LabelRecord]
+    stale_rows: int = 0
+    duplicate_ok_rows: int = 0
 
 
 def analyze_cooccurrence(
     input_file: str | Path = DEFAULT_INPUT_FILE,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     *,
+    cleaned_file: str | Path | None = None,
     sentiment_file: str | Path | None = DEFAULT_SENTIMENT_FILE,
     topic_file: str | Path | None = DEFAULT_TOPIC_FILE,
     limit: int | None = None,
@@ -136,6 +145,7 @@ def analyze_cooccurrence(
     content_path = Path(input_file)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    current_scope = load_current_record_scope(cleaned_file)
 
     network_outputs = {name: network_output_paths(output_path, prefix) for name, prefix in NETWORK_FILE_PREFIXES.items()}
     outputs = CooccurrenceOutputs(
@@ -152,6 +162,7 @@ def analyze_cooccurrence(
         limit=limit,
         min_confidence=min_confidence,
         include_fallback=include_fallback,
+        current_scope=current_scope,
     )
     content_records = content_data.records
     content_graph, content_used_rows = build_within_network(
@@ -168,6 +179,11 @@ def analyze_cooccurrence(
 
     graphs: dict[str, tuple[nx.Graph, int]] = {"content_labels": (content_graph, content_used_rows)}
     optional_inputs: dict[str, Any] = {
+        "cleaned_file": str(cleaned_file) if cleaned_file is not None else None,
+        "cleaned_status": "loaded" if current_scope is not None else ("disabled" if cleaned_file is None else "missing"),
+        "current_cleaned_records": len(current_scope[0]) if current_scope is not None else 0,
+        "content_stale_rows": content_data.stale_rows,
+        "content_duplicate_ok_rows": content_data.duplicate_ok_rows,
         "sentiment_file": None,
         "sentiment_status": "disabled",
         "topic_file": None,
@@ -184,11 +200,14 @@ def analyze_cooccurrence(
                 limit=limit,
                 min_confidence=sentiment_threshold,
                 include_fallback=include_sentiment_fallback,
+                current_scope=current_scope,
             )
             sentiment_records = sentiment_data.records
             optional_inputs["sentiment_status"] = "loaded"
             optional_inputs["sentiment_input_rows"] = sentiment_data.input_rows
             optional_inputs["sentiment_ok_rows"] = sentiment_data.ok_rows
+            optional_inputs["sentiment_stale_rows"] = sentiment_data.stale_rows
+            optional_inputs["sentiment_duplicate_ok_rows"] = sentiment_data.duplicate_ok_rows
 
             sentiment_graph, sentiment_used_rows = build_within_network(
                 (sentiment_nodes(record, include_fallback=include_sentiment_fallback) for record in sentiment_records),
@@ -363,12 +382,26 @@ def network_output_paths(output_dir: Path, prefix: str) -> NetworkOutputs:
     )
 
 
+def load_current_record_scope(cleaned_file: str | Path | None) -> tuple[set[str], set[int], dict[str, int]] | None:
+    if cleaned_file is None:
+        return None
+
+    cleaned_path = Path(cleaned_file)
+    if not cleaned_path.exists():
+        return None
+
+    records = DataLoader().load(cleaned_path)
+    hash_by_index = [record_hash(record) for record in records]
+    return set(hash_by_index), set(range(len(records))), {value: index for index, value in enumerate(hash_by_index)}
+
+
 def load_content_records(
     input_file: Path,
     *,
     limit: int | None,
     min_confidence: float,
     include_fallback: bool,
+    current_scope: tuple[set[str], set[int], dict[str, int]] | None = None,
 ) -> JsonlLoadResult:
     return load_label_records(
         input_file,
@@ -377,6 +410,7 @@ def load_content_records(
         min_confidence=min_confidence,
         fallback_category=CONTENT_FALLBACK_CATEGORY,
         include_fallback=include_fallback,
+        current_scope=current_scope,
     )
 
 
@@ -386,6 +420,7 @@ def load_sentiment_records(
     limit: int | None,
     min_confidence: float,
     include_fallback: bool,
+    current_scope: tuple[set[str], set[int], dict[str, int]] | None = None,
 ) -> JsonlLoadResult:
     return load_label_records(
         input_file,
@@ -394,6 +429,7 @@ def load_sentiment_records(
         min_confidence=min_confidence,
         fallback_category=SENTIMENT_FALLBACK_CATEGORY,
         include_fallback=include_fallback,
+        current_scope=current_scope,
     )
 
 
@@ -405,19 +441,45 @@ def load_label_records(
     min_confidence: float,
     fallback_category: str,
     include_fallback: bool,
+    current_scope: tuple[set[str], set[int], dict[str, int]] | None = None,
 ) -> JsonlLoadResult:
     input_rows = 0
     ok_rows = 0
+    stale_rows = 0
+    duplicate_ok_rows = 0
     records_by_key: dict[str, LabelRecord] = {}
+    allowed_hashes, allowed_indices, current_index_by_hash = (
+        current_scope if current_scope is not None else (None, None, None)
+    )
 
     for row in iter_jsonl(input_file):
-        if limit is not None and input_rows >= limit:
+        if current_scope is None and limit is not None and input_rows >= limit:
             break
         input_rows += 1
 
         if row.get("status") != "ok":
             continue
         ok_rows += 1
+        record_index = parse_optional_int(row.get("record_index"))
+        record_hash_value = parse_optional_str(row.get("record_hash"))
+        if record_hash_value is None and isinstance(row.get("record"), dict):
+            record_hash_value = record_dict_hash(row["record"])
+        key = label_record_key(
+            record_hash_value=record_hash_value,
+            record_index=record_index,
+            allowed_hashes=allowed_hashes,
+            allowed_indices=allowed_indices,
+        )
+        if key is None:
+            stale_rows += 1
+            continue
+        normalized_record_index = (
+            current_index_by_hash[record_hash_value]
+            if record_hash_value is not None
+            and current_index_by_hash is not None
+            and record_hash_value in current_index_by_hash
+            else record_index
+        )
 
         labels = extract_labels(
             row.get(section_name, {}),
@@ -426,8 +488,8 @@ def load_label_records(
             include_fallback=include_fallback,
         )
         record = LabelRecord(
-            record_index=parse_optional_int(row.get("record_index")),
-            record_hash=parse_optional_str(row.get("record_hash")),
+            record_index=normalized_record_index,
+            record_hash=record_hash_value,
             labels=tuple(labels),
             dominant_category=parse_optional_str(row.get(section_name, {}).get("dominant_category"))
             if isinstance(row.get(section_name), dict)
@@ -436,12 +498,17 @@ def load_label_records(
             if isinstance(row.get(section_name), dict)
             else None,
         )
-        key = record_key(record)
-        if key is None:
-            continue
+        if key in records_by_key:
+            duplicate_ok_rows += 1
         records_by_key[key] = record
 
-    return JsonlLoadResult(input_rows=input_rows, ok_rows=ok_rows, records=list(records_by_key.values()))
+    return JsonlLoadResult(
+        input_rows=input_rows,
+        ok_rows=ok_rows,
+        records=list(records_by_key.values()),
+        stale_rows=stale_rows,
+        duplicate_ok_rows=duplicate_ok_rows,
+    )
 
 
 def iter_jsonl(input_file: Path) -> Iterable[dict[str, Any]]:
@@ -450,6 +517,24 @@ def iter_jsonl(input_file: Path) -> Iterable[dict[str, Any]]:
             if not line.strip():
                 continue
             yield json.loads(line)
+
+
+def label_record_key(
+    *,
+    record_hash_value: str | None,
+    record_index: int | None,
+    allowed_hashes: set[str] | None,
+    allowed_indices: set[int] | None,
+) -> str | None:
+    if record_hash_value:
+        if allowed_hashes is not None and record_hash_value not in allowed_hashes:
+            return None
+        return f"hash:{record_hash_value}"
+    if record_index is not None:
+        if allowed_indices is not None and record_index not in allowed_indices:
+            return None
+        return f"index:{record_index}"
+    return None
 
 
 def extract_labels(
@@ -816,6 +901,9 @@ def write_summary(
         "input_file": str(input_file),
         "input_rows": input_rows,
         "ok_rows": ok_rows,
+        "current_cleaned_records": optional_inputs.get("current_cleaned_records", 0),
+        "stale_content_rows": optional_inputs.get("content_stale_rows", 0),
+        "duplicate_content_ok_rows": optional_inputs.get("content_duplicate_ok_rows", 0),
         "used_rows": used_rows,
         "skipped_rows": input_rows - used_rows,
         "node_count": graph.number_of_nodes(),
@@ -921,6 +1009,11 @@ def main() -> None:
         help="BERTopic comment_topics.csv file. Skipped when the file does not exist.",
     )
     parser.add_argument(
+        "--cleaned-file",
+        default=str(DEFAULT_CLEANED_FILE),
+        help="Current cleaned CSV used to filter stale JSONL analysis rows.",
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(DEFAULT_OUTPUT_DIR),
         help="Folder for co-occurrence outputs. Defaults to data/cooccurrence_analysis.",
@@ -985,6 +1078,7 @@ def main() -> None:
     report = analyze_cooccurrence(
         input_file=args.input_file,
         output_dir=args.output_dir,
+        cleaned_file=args.cleaned_file,
         sentiment_file=None if args.no_sentiment else args.sentiment_file,
         topic_file=None if args.no_topic else args.topic_file,
         limit=args.limit,

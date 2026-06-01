@@ -130,7 +130,7 @@ def analyze_content(
     if overwrite and output_path.exists():
         output_path.unlink()
 
-    successful_records = load_successful_record_hashes(output_path)
+    successful_hashes = load_successful_record_hashes(output_path)
     records = DataLoader().load(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -143,7 +143,7 @@ def analyze_content(
             break
 
         current_record_hash = record_hash(record)
-        if current_record_hash in successful_records.get(record_index, set()):
+        if current_record_hash in successful_hashes:
             skipped_records += 1
             continue
 
@@ -234,11 +234,11 @@ def resolve_output_file(output_file: str | Path | None, output_dir: str | Path |
     return DEFAULT_OUTPUT_FILE
 
 
-def load_successful_record_hashes(output_file: Path) -> dict[int, set[str]]:
+def load_successful_record_hashes(output_file: Path) -> set[str]:
     if not output_file.exists():
-        return {}
+        return set()
 
-    successful_records: dict[int, set[str]] = {}
+    successful_hashes: set[str] = set()
     with output_file.open("r", encoding="utf-8") as output_stream:
         for line in output_stream:
             if not line.strip():
@@ -247,18 +247,17 @@ def load_successful_record_hashes(output_file: Path) -> dict[int, set[str]]:
                 row = json.loads(line)
                 if row.get("status") != "ok":
                     continue
-                index = int(row["record_index"])
                 existing_hash = row.get("record_hash")
                 if not isinstance(existing_hash, str):
                     existing_record = row.get("record")
                     if not isinstance(existing_record, dict):
                         continue
                     existing_hash = record_dict_hash(existing_record)
-                successful_records.setdefault(index, set()).add(existing_hash)
+                successful_hashes.add(existing_hash)
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
 
-    return successful_records
+    return successful_hashes
 
 
 def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:

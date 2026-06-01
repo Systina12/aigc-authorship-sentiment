@@ -29,6 +29,7 @@ from wordcloud import WordCloud
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dataloader import DataLoader
+from scripts.analyze_content import record_dict_hash, record_hash
 
 
 DEFAULT_CLEANED_FILE = Path("data/cleaned/comments_cleaned.csv")
@@ -140,6 +141,8 @@ class JsonlLoadResult:
     input_rows: int = 0
     ok_rows: int = 0
     error_rows: int = 0
+    stale_rows: int = 0
+    duplicate_ok_rows: int = 0
     records: list[AnalysisRecord] = field(default_factory=list)
 
 
@@ -197,11 +200,17 @@ def build_analysis_report(
     font_path, font_name = configure_chinese_font(warnings)
 
     cleaned_records = load_cleaned_records(cleaned_path, limit=limit, input_status=input_status, warnings=warnings)
+    allowed_hashes, allowed_indices, current_index_by_hash = build_current_record_scope(
+        cleaned_records, input_status["cleaned_file"]
+    )
     content_data = load_analysis_file(
         content_path,
         section_name="analysis",
         min_confidence=min_confidence,
         limit=limit,
+        allowed_hashes=allowed_hashes,
+        allowed_indices=allowed_indices,
+        current_index_by_hash=current_index_by_hash,
         input_status=input_status,
         input_name="content_file",
         warnings=warnings,
@@ -211,6 +220,9 @@ def build_analysis_report(
         section_name="sentiment",
         min_confidence=sentiment_threshold,
         limit=limit,
+        allowed_hashes=allowed_hashes,
+        allowed_indices=allowed_indices,
+        current_index_by_hash=current_index_by_hash,
         input_status=input_status,
         input_name="sentiment_file",
         warnings=warnings,
@@ -388,12 +400,26 @@ def load_cleaned_records(
         return []
 
 
+def build_current_record_scope(
+    cleaned_records: list[Any],
+    cleaned_status: dict[str, Any],
+) -> tuple[set[str] | None, set[int] | None, dict[str, int] | None]:
+    if cleaned_status.get("status") != "loaded":
+        return None, None, None
+
+    hash_by_index = [record_hash(record) for record in cleaned_records]
+    return set(hash_by_index), set(range(len(cleaned_records))), {value: index for index, value in enumerate(hash_by_index)}
+
+
 def load_analysis_file(
     input_file: Path,
     *,
     section_name: str,
     min_confidence: float,
     limit: int | None,
+    allowed_hashes: set[str] | None,
+    allowed_indices: set[int] | None,
+    current_index_by_hash: dict[str, int] | None,
     input_status: dict[str, dict[str, Any]],
     input_name: str,
     warnings: list[str],
@@ -405,54 +431,96 @@ def load_analysis_file(
     input_rows = 0
     ok_rows = 0
     error_rows = 0
-    records: list[AnalysisRecord] = []
+    stale_rows = 0
+    duplicate_ok_rows = 0
+    records_by_key: dict[str, AnalysisRecord] = {}
+    current_error_keys: set[str] = set()
     try:
         for line_position, row in enumerate(iter_jsonl(input_file)):
             record_index = parse_optional_int(row.get("record_index"))
             effective_index = record_index if record_index is not None else line_position
-            if limit is not None and effective_index >= limit:
+            if allowed_hashes is None and limit is not None and effective_index >= limit:
                 continue
 
             input_rows += 1
+            existing_hash = parse_optional_str(row.get("record_hash"))
+            if existing_hash is None and isinstance(row.get("record"), dict):
+                existing_hash = record_dict_hash(row["record"])
+            record_key = analysis_record_key(
+                record_hash_value=existing_hash,
+                record_index=record_index,
+                allowed_hashes=allowed_hashes,
+                allowed_indices=allowed_indices,
+            )
+            if record_key is None:
+                stale_rows += 1
+                continue
             if row.get("status") != "ok":
-                error_rows += 1
+                records_by_key.pop(record_key, None)
+                current_error_keys.add(record_key)
                 continue
             ok_rows += 1
+            current_error_keys.discard(record_key)
+            normalized_record_index = (
+                current_index_by_hash[existing_hash]
+                if existing_hash is not None
+                and current_index_by_hash is not None
+                and existing_hash in current_index_by_hash
+                else record_index
+            )
 
             section = row.get(section_name)
             if not isinstance(section, dict):
-                records.append(
-                    AnalysisRecord(
-                        record_index=record_index,
-                        record_hash=parse_optional_str(row.get("record_hash")),
-                    )
-                )
+                record = AnalysisRecord(record_index=normalized_record_index, record_hash=existing_hash)
+                if record_key in records_by_key:
+                    duplicate_ok_rows += 1
+                records_by_key[record_key] = record
                 continue
 
-            records.append(
-                AnalysisRecord(
-                    record_index=record_index,
-                    record_hash=parse_optional_str(row.get("record_hash")),
-                    labels=tuple(extract_labels(section, min_confidence=min_confidence)),
-                    dominant_category=parse_optional_str(section.get("dominant_category")),
-                    sentiment_polarity=parse_optional_str(section.get("sentiment_polarity")),
-                )
+            record = AnalysisRecord(
+                record_index=normalized_record_index,
+                record_hash=existing_hash,
+                labels=tuple(extract_labels(section, min_confidence=min_confidence)),
+                dominant_category=parse_optional_str(section.get("dominant_category")),
+                sentiment_polarity=parse_optional_str(section.get("sentiment_polarity")),
             )
+            if record_key in records_by_key:
+                duplicate_ok_rows += 1
+            records_by_key[record_key] = record
     except Exception as exc:  # noqa: BLE001
+        error_rows = len(current_error_keys)
         input_status[input_name].update({"status": "error", "error": str(exc)})
         warnings.append(f"Failed to load {input_name}: {exc}")
-        return JsonlLoadResult(input_rows=input_rows, ok_rows=ok_rows, error_rows=error_rows, records=records)
+        return JsonlLoadResult(
+            input_rows=input_rows,
+            ok_rows=ok_rows,
+            error_rows=error_rows,
+            stale_rows=stale_rows,
+            duplicate_ok_rows=duplicate_ok_rows,
+            records=list(records_by_key.values()),
+        )
 
+    error_rows = len(current_error_keys)
+    records = list(records_by_key.values())
     input_status[input_name].update(
         {
             "status": "loaded",
             "input_rows": input_rows,
             "ok_rows": ok_rows,
             "error_rows": error_rows,
+            "stale_rows": stale_rows,
+            "duplicate_ok_rows": duplicate_ok_rows,
             "records": len(records),
         }
     )
-    return JsonlLoadResult(input_rows=input_rows, ok_rows=ok_rows, error_rows=error_rows, records=records)
+    return JsonlLoadResult(
+        input_rows=input_rows,
+        ok_rows=ok_rows,
+        error_rows=error_rows,
+        stale_rows=stale_rows,
+        duplicate_ok_rows=duplicate_ok_rows,
+        records=records,
+    )
 
 
 def iter_jsonl(input_file: Path) -> Iterable[dict[str, Any]]:
@@ -460,6 +528,24 @@ def iter_jsonl(input_file: Path) -> Iterable[dict[str, Any]]:
         for line in jsonl_file:
             if line.strip():
                 yield json.loads(line)
+
+
+def analysis_record_key(
+    *,
+    record_hash_value: str | None,
+    record_index: int | None,
+    allowed_hashes: set[str] | None,
+    allowed_indices: set[int] | None,
+) -> str | None:
+    if record_hash_value:
+        if allowed_hashes is not None and record_hash_value not in allowed_hashes:
+            return None
+        return f"hash:{record_hash_value}"
+    if record_index is not None:
+        if allowed_indices is not None and record_index not in allowed_indices:
+            return None
+        return f"index:{record_index}"
+    return None
 
 
 def extract_labels(section: dict[str, Any], *, min_confidence: float) -> list[Label]:
@@ -814,12 +900,16 @@ def build_quality_metrics(
         "content_input_rows": content_data.input_rows,
         "content_ok_rows": content_data.ok_rows,
         "content_error_rows": content_data.error_rows,
+        "content_stale_rows": content_data.stale_rows,
+        "content_duplicate_ok_rows": content_data.duplicate_ok_rows,
         "content_records_with_labels": sum(1 for record in content_records if record.labels),
         "content_label_occurrences": sum(len(record.labels) for record in content_records),
         "content_fallback_records": content_fallback_records,
         "sentiment_input_rows": sentiment_data.input_rows,
         "sentiment_ok_rows": sentiment_data.ok_rows,
         "sentiment_error_rows": sentiment_data.error_rows,
+        "sentiment_stale_rows": sentiment_data.stale_rows,
+        "sentiment_duplicate_ok_rows": sentiment_data.duplicate_ok_rows,
         "sentiment_records_with_labels": sum(1 for record in sentiment_records if record.labels),
         "sentiment_label_occurrences": sum(len(record.labels) for record in sentiment_records),
         "sentiment_fallback_records": sentiment_fallback_records,

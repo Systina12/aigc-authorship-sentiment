@@ -138,6 +138,7 @@ def test_run_full_analysis_orchestrates_all_stages(monkeypatch, tmp_path):
 
     cooccurrence_kwargs = calls[4][1]
     assert cooccurrence_kwargs["input_file"] == content_dir / "comment_labels.jsonl"
+    assert cooccurrence_kwargs["cleaned_file"] == cleaned_file
     assert cooccurrence_kwargs["sentiment_file"] == sentiment_dir / "comment_sentiment.jsonl"
     assert cooccurrence_kwargs["topic_file"] == topic_dir / "comment_topics.csv"
     assert cooccurrence_kwargs["min_confidence"] == 0.7
