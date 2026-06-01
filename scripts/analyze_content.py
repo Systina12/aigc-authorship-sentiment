@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
@@ -21,6 +22,10 @@ DEFAULT_INPUT_FILE = Path("data/cleaned/comments_cleaned.csv")
 DEFAULT_OUTPUT_DIR = Path("data/content_analysis")
 DEFAULT_OUTPUT_FILE_NAME = "comment_labels.jsonl"
 DEFAULT_OUTPUT_FILE = DEFAULT_OUTPUT_DIR / DEFAULT_OUTPUT_FILE_NAME
+USER_AGENT = "codex"
+CHAT_COMPLETIONS_API_TYPE = "chat_completions"
+RESPONSES_API_TYPE = "responses"
+SUPPORTED_API_TYPES = {CHAT_COMPLETIONS_API_TYPE, RESPONSES_API_TYPE}
 
 CATEGORIES = (
     "技术认可",
@@ -93,6 +98,7 @@ class LLMConfig:
     model: str
     reasoning_effort: str = ""
     response_format_type: str = "json_object"
+    api_type: str = CHAT_COMPLETIONS_API_TYPE
 
 
 @dataclass(frozen=True)
@@ -175,6 +181,7 @@ def load_config(config_file: str | Path) -> LLMConfig:
         model=str(config.get("model", "")),
         reasoning_effort=str(config.get("reasoning_effort", "")),
         response_format_type=str(config.get("response_format_type", "json_object")),
+        api_type=str(config.get("api_type", config.get("endpoint_type", CHAT_COMPLETIONS_API_TYPE))),
     )
     validate_configuration(llm_config, config_path=config_path)
     return llm_config
@@ -188,6 +195,11 @@ def validate_configuration(config: LLMConfig, *, config_path: Path) -> None:
     ]
     if missing:
         raise ValueError(f"LLM config is incomplete in {config_path}. Fill these fields: {', '.join(missing)}")
+    if normalize_api_type(config.api_type) not in SUPPORTED_API_TYPES:
+        raise ValueError(
+            f"LLM config has unsupported api_type in {config_path}: {config.api_type!r}. "
+            f"Use {CHAT_COMPLETIONS_API_TYPE!r} or {RESPONSES_API_TYPE!r}."
+        )
 
 
 def resolve_output_file(output_file: str | Path | None, output_dir: str | Path | None) -> Path:
@@ -226,24 +238,22 @@ def load_successful_record_hashes(output_file: Path) -> dict[int, set[str]]:
 
 
 def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:
-    payload = build_payload(
+    payload = build_request_payload(
         record,
         model=config.model,
         reasoning_effort=config.reasoning_effort,
         response_format_type=config.response_format_type,
+        api_type=config.api_type,
     )
     response = requests.post(
-        chat_completions_url(config.base_url),
-        headers={
-            "Authorization": f"Bearer {config.api_key}",
-            "Content-Type": "application/json",
-        },
+        llm_endpoint_url(config.base_url, config.api_type),
+        headers=build_headers(config.api_key),
         json=payload,
         timeout=60,
     )
-    response.raise_for_status()
+    raise_for_status_with_body(response)
     response_body = response.json()
-    content = response_body["choices"][0]["message"]["content"]
+    content = extract_response_content(response_body, config.api_type)
     if not isinstance(content, str):
         raise ValueError("LLM response content is not a string")
 
@@ -251,10 +261,106 @@ def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:
 
 
 def chat_completions_url(base_url: str) -> str:
-    normalized = base_url.rstrip("/")
+    normalized = normalize_base_url(base_url)
     if normalized.endswith("/chat/completions"):
         return normalized
+    if normalized.endswith("/responses"):
+        return f"{normalized.removesuffix('/responses')}/chat/completions"
     return f"{normalized}/chat/completions"
+
+
+def responses_url(base_url: str) -> str:
+    normalized = normalize_base_url(base_url)
+    if normalized.endswith("/responses"):
+        return normalized
+    if normalized.endswith("/chat/completions"):
+        return f"{normalized.removesuffix('/chat/completions')}/responses"
+    return f"{normalized}/responses"
+
+
+def llm_endpoint_url(base_url: str, api_type: str = CHAT_COMPLETIONS_API_TYPE) -> str:
+    normalized_api_type = normalize_api_type(api_type)
+    if normalized_api_type == RESPONSES_API_TYPE:
+        return responses_url(base_url)
+    return chat_completions_url(base_url)
+
+
+def normalize_api_type(api_type: str) -> str:
+    normalized = api_type.strip().casefold().replace("-", "_")
+    if normalized in {"chat", "chat_completion", "chat_completions", "completion", "completions"}:
+        return CHAT_COMPLETIONS_API_TYPE
+    if normalized in {"response", "responses"}:
+        return RESPONSES_API_TYPE
+    return normalized
+
+
+def build_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+
+def raise_for_status_with_body(response: requests.Response) -> None:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        response_text = getattr(response, "text", "")
+        if isinstance(response_text, str) and response_text:
+            response_text = response_text[:2000]
+            raise requests.HTTPError(f"{exc}; response body: {response_text}", response=response) from exc
+        raise
+
+
+def normalize_base_url(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    if not normalized:
+        return normalized
+    if normalized.startswith("//"):
+        return f"https:{normalized}"
+    if "://" in normalized:
+        return normalized
+    if should_default_to_http(normalized):
+        return f"http://{normalized}"
+    return f"https://{normalized}"
+
+
+def should_default_to_http(base_url: str) -> bool:
+    host = urlsplit(f"//{base_url}").hostname or base_url.split("/", 1)[0]
+    host = host.strip("[]").casefold()
+    return (
+        host == "localhost"
+        or host == "::1"
+        or host.startswith("127.")
+        or host.startswith("10.")
+        or host.startswith("192.168.")
+        or host.startswith("172.")
+        or ":" in base_url.split("/", 1)[0]
+    )
+
+
+def build_request_payload(
+    record: CommentRecord,
+    *,
+    model: str,
+    reasoning_effort: str = "",
+    response_format_type: str = "json_object",
+    api_type: str = CHAT_COMPLETIONS_API_TYPE,
+) -> dict[str, Any]:
+    if normalize_api_type(api_type) == RESPONSES_API_TYPE:
+        return build_responses_payload(
+            record,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            response_format_type=response_format_type,
+        )
+    return build_payload(
+        record,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        response_format_type=response_format_type,
+    )
 
 
 def build_payload(
@@ -285,10 +391,109 @@ def build_payload(
                 "strict": True,
             },
         }
-    else:
+    elif response_format_type != "none":
         payload["response_format"] = {"type": response_format_type}
 
     return payload
+
+
+def build_responses_payload(
+    record: CommentRecord,
+    *,
+    model: str,
+    reasoning_effort: str = "",
+    response_format_type: str = "json_object",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "temperature": 0.1,
+        "input": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Return only valid json. No Markdown.\nComment content:\n{record.content}",
+            },
+        ],
+    }
+    if reasoning_effort.strip():
+        payload["reasoning"] = {"effort": reasoning_effort.strip()}
+
+    text_format = build_responses_text_format(
+        response_format_type=response_format_type,
+        schema_name="content_analysis",
+        schema=ANALYSIS_SCHEMA,
+    )
+    if text_format is not None:
+        payload["text"] = {"format": text_format}
+
+    return payload
+
+
+def build_responses_text_format(
+    *,
+    response_format_type: str,
+    schema_name: str,
+    schema: dict[str, Any],
+) -> dict[str, Any] | None:
+    response_format_type = response_format_type.strip() or "json_object"
+    if response_format_type == "none":
+        return None
+    if response_format_type == "json_schema":
+        return {
+            "type": "json_schema",
+            "name": schema_name,
+            "schema": schema,
+            "strict": True,
+        }
+    return {"type": response_format_type}
+
+
+def extract_response_content(response_body: dict[str, Any], api_type: str = CHAT_COMPLETIONS_API_TYPE) -> str:
+    if normalize_api_type(api_type) == RESPONSES_API_TYPE:
+        return extract_responses_content(response_body)
+    return extract_chat_completions_content(response_body)
+
+
+def extract_chat_completions_content(response_body: dict[str, Any]) -> str:
+    content = response_body["choices"][0]["message"]["content"]
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = [part.get("text", "") for part in content if isinstance(part, dict)]
+        joined = "".join(part for part in text_parts if isinstance(part, str))
+        if joined:
+            return joined
+    raise ValueError("LLM response content is not a string")
+
+
+def extract_responses_content(response_body: dict[str, Any]) -> str:
+    output_text = response_body.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+
+    output = response_body.get("output")
+    if isinstance(output, list):
+        text_parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for content_item in content:
+                if not isinstance(content_item, dict):
+                    continue
+                text = content_item.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+        if text_parts:
+            return "".join(text_parts)
+
+    choices = response_body.get("choices")
+    if isinstance(choices, list) and choices:
+        return extract_chat_completions_content(response_body)
+
+    raise ValueError("Responses API response does not contain output text")
 
 
 def normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:

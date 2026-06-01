@@ -32,6 +32,27 @@ class FakeResponse:
         }
 
 
+class FakeJSONResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._body
+
+
+class FakeHTTPErrorResponse:
+    text = '{"error":{"message":"bad response"}}'
+
+    def raise_for_status(self):
+        raise content_analysis.requests.HTTPError("400 Client Error")
+
+    def json(self):
+        return {"error": {"message": "bad response"}}
+
+
 def test_analyze_content_respects_limit_and_writes_multilabel_jsonl(tmp_path, monkeypatch):
     input_file = tmp_path / "comments_cleaned.csv"
     output_file = tmp_path / "comment_labels.jsonl"
@@ -46,9 +67,11 @@ def test_analyze_content_respects_limit_and_writes_multilabel_jsonl(tmp_path, mo
     )
     posted_payloads = []
     posted_urls = []
+    posted_headers = []
 
     def fake_post(url, headers, json, timeout):
         posted_urls.append(url)
+        posted_headers.append(headers)
         posted_payloads.append(json)
         return FakeResponse(
             json_dumps(
@@ -79,6 +102,7 @@ def test_analyze_content_respects_limit_and_writes_multilabel_jsonl(tmp_path, mo
     assert len(rows) == 2
     assert rows[0]["status"] == "ok"
     assert rows[0]["record_hash"]
+    assert posted_headers[0]["User-Agent"] == "codex"
     assert posted_payloads[0]["reasoning_effort"] == REASONING_EFFORT
     assert posted_payloads[0]["response_format"] == {"type": RESPONSE_FORMAT_TYPE}
     assert [label["category"] for label in rows[0]["analysis"]["labels"]] == ["工具化认知", "版权争议"]
@@ -195,6 +219,31 @@ def test_analyze_content_writes_errors_and_continues(tmp_path, monkeypatch):
     assert rows[1]["error_type"] == "JSONDecodeError"
 
 
+def test_analyze_content_writes_http_error_response_body(tmp_path, monkeypatch):
+    input_file = tmp_path / "comments_cleaned.csv"
+    output_file = tmp_path / "comment_labels.jsonl"
+    config_file = write_config(tmp_path, api_type="responses")
+    write_comment_csv(input_file, ["bad provider request"])
+
+    def fake_post(url, headers, json, timeout):
+        return FakeHTTPErrorResponse()
+
+    monkeypatch.setattr(content_analysis.requests, "post", fake_post)
+
+    content_analysis.analyze_content(
+        input_file=input_file,
+        output_file=output_file,
+        config_file=config_file,
+    )
+
+    rows = read_jsonl(output_file)
+
+    assert rows[0]["status"] == "error"
+    assert rows[0]["error_type"] == "HTTPError"
+    assert "response body" in rows[0]["error_message"]
+    assert "bad response" in rows[0]["error_message"]
+
+
 def test_analyze_content_retries_existing_error_rows(tmp_path, monkeypatch):
     input_file = tmp_path / "comments_cleaned.csv"
     output_file = tmp_path / "comment_labels.jsonl"
@@ -296,18 +345,98 @@ def test_analyze_content_requires_complete_config(tmp_path):
     assert not output_file.exists()
 
 
-def write_config(tmp_path):
-    config_file = tmp_path / "content_analysis_config.json"
-    config_file.write_text(
-        json_dumps(
+def test_analyze_content_supports_responses_api_output_text(tmp_path, monkeypatch):
+    input_file = tmp_path / "comments_cleaned.csv"
+    output_file = tmp_path / "comment_labels.jsonl"
+    config_file = write_config(tmp_path, api_type="responses")
+    write_comment_csv(input_file, ["AI helps with repetitive drawing work"])
+    posted_urls = []
+    posted_payloads = []
+
+    def fake_post(url, headers, json, timeout):
+        posted_urls.append(url)
+        posted_payloads.append(json)
+        return FakeJSONResponse({"output_text": success_response()})
+
+    monkeypatch.setattr(content_analysis.requests, "post", fake_post)
+
+    report = content_analysis.analyze_content(
+        input_file=input_file,
+        output_file=output_file,
+        config_file=config_file,
+    )
+
+    rows = read_jsonl(output_file)
+
+    assert report.written_records == 1
+    assert posted_urls == [f"{BASE_URL}/responses"]
+    assert "input" in posted_payloads[0]
+    assert "messages" not in posted_payloads[0]
+    assert posted_payloads[0]["input"][1]["content"] == (
+        "Return only valid json. No Markdown.\nComment content:\nAI helps with repetitive drawing work"
+    )
+    assert posted_payloads[0]["reasoning"] == {"effort": REASONING_EFFORT}
+    assert posted_payloads[0]["text"]["format"] == {"type": RESPONSE_FORMAT_TYPE}
+    assert rows[0]["status"] == "ok"
+
+
+def test_extract_responses_content_supports_nested_output_text():
+    response_body = {
+        "output": [
             {
-                "base_url": BASE_URL,
-                "api_key": API_KEY,
-                "model": MODEL,
-                "reasoning_effort": REASONING_EFFORT,
-                "response_format_type": RESPONSE_FORMAT_TYPE,
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": "{\"summary\":\""},
+                    {"type": "output_text", "text": "ok\",\"labels\":[]}"},
+                ],
             }
-        ),
+        ]
+    }
+
+    assert content_analysis.extract_response_content(response_body, "responses") == '{"summary":"ok","labels":[]}'
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        ("http://localhost:8000/v1", "http://localhost:8000/v1/chat/completions"),
+        ("localhost:8000/v1", "http://localhost:8000/v1/chat/completions"),
+        ("127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1/chat/completions"),
+        ("192.168.58.133:8000/v1", "http://192.168.58.133:8000/v1/chat/completions"),
+        ("https://api.example.test/v1", "https://api.example.test/v1/chat/completions"),
+        ("api.example.test/v1", "https://api.example.test/v1/chat/completions"),
+        ("http://localhost:8000/v1/chat/completions", "http://localhost:8000/v1/chat/completions"),
+    ],
+)
+def test_chat_completions_url_supports_http_and_bare_hosts(base_url, expected):
+    assert content_analysis.chat_completions_url(base_url) == expected
+
+
+@pytest.mark.parametrize(
+    ("base_url", "api_type", "expected"),
+    [
+        ("http://localhost:8000/v1", "responses", "http://localhost:8000/v1/responses"),
+        ("http://localhost:8000/v1/chat/completions", "responses", "http://localhost:8000/v1/responses"),
+        ("http://localhost:8000/v1/responses", "responses", "http://localhost:8000/v1/responses"),
+        ("http://localhost:8000/v1/responses", "chat_completions", "http://localhost:8000/v1/chat/completions"),
+    ],
+)
+def test_llm_endpoint_url_supports_responses(base_url, api_type, expected):
+    assert content_analysis.llm_endpoint_url(base_url, api_type) == expected
+
+
+def write_config(tmp_path, **overrides):
+    config_file = tmp_path / "content_analysis_config.json"
+    config = {
+        "base_url": BASE_URL,
+        "api_key": API_KEY,
+        "model": MODEL,
+        "reasoning_effort": REASONING_EFFORT,
+        "response_format_type": RESPONSE_FORMAT_TYPE,
+    }
+    config.update(overrides)
+    config_file.write_text(
+        json_dumps(config),
         encoding="utf-8",
     )
     return config_file

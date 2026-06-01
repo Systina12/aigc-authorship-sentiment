@@ -33,6 +33,17 @@ class FakeResponse:
         }
 
 
+class FakeJSONResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._body
+
+
 def test_analyze_sentiment_respects_limit_and_writes_multilabel_jsonl(tmp_path, monkeypatch):
     input_file = tmp_path / "comments_cleaned.csv"
     output_file = tmp_path / "comment_sentiment.jsonl"
@@ -47,9 +58,11 @@ def test_analyze_sentiment_respects_limit_and_writes_multilabel_jsonl(tmp_path, 
     )
     posted_payloads = []
     posted_urls = []
+    posted_headers = []
 
     def fake_post(url, headers, json, timeout):
         posted_urls.append(url)
+        posted_headers.append(headers)
         posted_payloads.append(json)
         return FakeResponse(
             json_dumps(
@@ -82,6 +95,7 @@ def test_analyze_sentiment_respects_limit_and_writes_multilabel_jsonl(tmp_path, 
     assert len(rows) == 2
     assert rows[0]["status"] == "ok"
     assert rows[0]["record_hash"]
+    assert posted_headers[0]["User-Agent"] == "codex"
     assert posted_payloads[0]["reasoning_effort"] == REASONING_EFFORT
     assert posted_payloads[0]["response_format"] == {"type": RESPONSE_FORMAT_TYPE}
     assert posted_payloads[0]["messages"][1]["content"] == "评论内容：AI 会让画师没饭吃，太可怕了"
@@ -298,18 +312,54 @@ def test_analyze_sentiment_requires_complete_config(tmp_path):
     assert not output_file.exists()
 
 
-def write_config(tmp_path):
+def test_analyze_sentiment_supports_responses_api_output_text(tmp_path, monkeypatch):
+    input_file = tmp_path / "comments_cleaned.csv"
+    output_file = tmp_path / "comment_sentiment.jsonl"
+    config_file = write_config(tmp_path, api_type="responses")
+    write_comment_csv(input_file, ["AI sarcasm is obvious here"])
+    posted_urls = []
+    posted_payloads = []
+
+    def fake_post(url, headers, json, timeout):
+        posted_urls.append(url)
+        posted_payloads.append(json)
+        return FakeJSONResponse({"output_text": success_response()})
+
+    monkeypatch.setattr(sentiment_analysis.requests, "post", fake_post)
+
+    report = sentiment_analysis.analyze_sentiment(
+        input_file=input_file,
+        output_file=output_file,
+        config_file=config_file,
+    )
+
+    rows = read_jsonl(output_file)
+
+    assert report.written_records == 1
+    assert posted_urls == [f"{BASE_URL}/responses"]
+    assert "input" in posted_payloads[0]
+    assert "messages" not in posted_payloads[0]
+    assert posted_payloads[0]["input"][1]["content"] == (
+        "Return only valid json. No Markdown.\nComment content:\nAI sarcasm is obvious here"
+    )
+    assert posted_payloads[0]["reasoning"] == {"effort": REASONING_EFFORT}
+    assert posted_payloads[0]["text"]["format"] == {"type": RESPONSE_FORMAT_TYPE}
+    assert rows[0]["status"] == "ok"
+    assert rows[0]["sentiment"]["sentiment_polarity"] == "neutral"
+
+
+def write_config(tmp_path, **overrides):
     config_file = tmp_path / "content_analysis_config.json"
+    config = {
+        "base_url": BASE_URL,
+        "api_key": API_KEY,
+        "model": MODEL,
+        "reasoning_effort": REASONING_EFFORT,
+        "response_format_type": RESPONSE_FORMAT_TYPE,
+    }
+    config.update(overrides)
     config_file.write_text(
-        json_dumps(
-            {
-                "base_url": BASE_URL,
-                "api_key": API_KEY,
-                "model": MODEL,
-                "reasoning_effort": REASONING_EFFORT,
-                "response_format_type": RESPONSE_FORMAT_TYPE,
-            }
-        ),
+        json_dumps(config),
         encoding="utf-8",
     )
     return config_file

@@ -15,11 +15,17 @@ from dataloader import CommentRecord, DataLoader
 from scripts.analyze_content import (
     DEFAULT_CONFIG_FILE,
     LLMConfig,
-    chat_completions_url,
+    build_headers,
+    build_responses_text_format,
     current_timestamp,
+    extract_response_content,
     load_config,
     load_successful_record_hashes,
+    llm_endpoint_url,
+    normalize_api_type,
+    raise_for_status_with_body,
     record_hash,
+    RESPONSES_API_TYPE,
 )
 
 
@@ -166,28 +172,49 @@ def resolve_output_file(output_file: str | Path | None, output_dir: str | Path |
 
 
 def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:
-    payload = build_payload(
+    payload = build_request_payload(
         record,
         model=config.model,
         reasoning_effort=config.reasoning_effort,
         response_format_type=config.response_format_type,
+        api_type=config.api_type,
     )
     response = requests.post(
-        chat_completions_url(config.base_url),
-        headers={
-            "Authorization": f"Bearer {config.api_key}",
-            "Content-Type": "application/json",
-        },
+        llm_endpoint_url(config.base_url, config.api_type),
+        headers=build_headers(config.api_key),
         json=payload,
         timeout=60,
     )
-    response.raise_for_status()
+    raise_for_status_with_body(response)
     response_body = response.json()
-    content = response_body["choices"][0]["message"]["content"]
+    content = extract_response_content(response_body, config.api_type)
     if not isinstance(content, str):
         raise ValueError("LLM response content is not a string")
 
     return normalize_sentiment(json.loads(content))
+
+
+def build_request_payload(
+    record: CommentRecord,
+    *,
+    model: str,
+    reasoning_effort: str = "",
+    response_format_type: str = "json_object",
+    api_type: str = "",
+) -> dict[str, Any]:
+    if normalize_api_type(api_type) == RESPONSES_API_TYPE:
+        return build_responses_payload(
+            record,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            response_format_type=response_format_type,
+        )
+    return build_payload(
+        record,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        response_format_type=response_format_type,
+    )
 
 
 def build_payload(
@@ -218,8 +245,40 @@ def build_payload(
                 "strict": True,
             },
         }
-    else:
+    elif response_format_type != "none":
         payload["response_format"] = {"type": response_format_type}
+
+    return payload
+
+
+def build_responses_payload(
+    record: CommentRecord,
+    *,
+    model: str,
+    reasoning_effort: str = "",
+    response_format_type: str = "json_object",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "temperature": 0.1,
+        "input": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Return only valid json. No Markdown.\nComment content:\n{record.content}",
+            },
+        ],
+    }
+    if reasoning_effort.strip():
+        payload["reasoning"] = {"effort": reasoning_effort.strip()}
+
+    text_format = build_responses_text_format(
+        response_format_type=response_format_type,
+        schema_name="sentiment_analysis",
+        schema=SENTIMENT_SCHEMA,
+    )
+    if text_format is not None:
+        payload["text"] = {"format": text_format}
 
     return payload
 

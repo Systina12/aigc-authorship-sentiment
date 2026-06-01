@@ -16,9 +16,13 @@ class FakeResponse:
 def test_provider_check_reports_valid_minimal_json(tmp_path, monkeypatch):
     config_file = write_config(tmp_path)
     posted_payloads = []
+    posted_headers = []
+    posted_urls = []
 
     def fake_post(url, headers, json, timeout):
+        posted_urls.append(url)
         posted_payloads.append(json)
+        posted_headers.append(headers)
         return FakeResponse(
             body={
                 "choices": [
@@ -36,11 +40,42 @@ def test_provider_check_reports_valid_minimal_json(tmp_path, monkeypatch):
 
     assert report.ok is True
     assert report.http_status == 200
+    assert posted_urls == ["https://example.test/v1/chat/completions"]
     assert report.choice_count == 1
     assert report.finish_reason == "stop"
     assert report.content_json_ok is True
     assert report.normalized_ok is True
+    assert posted_headers[0]["User-Agent"] == "codex"
     assert posted_payloads[0]["response_format"] == {"type": "json_object"}
+
+
+def test_provider_check_supports_responses_api_minimal_payload(tmp_path, monkeypatch):
+    config_file = write_config(tmp_path)
+    posted_payloads = []
+    posted_urls = []
+
+    def fake_post(url, headers, json, timeout):
+        posted_urls.append(url)
+        posted_payloads.append(json)
+        return FakeResponse(body={"output_text": '{"ok": true, "note": "provider test"}'})
+
+    monkeypatch.setattr(check_llm_provider.requests, "post", fake_post)
+
+    report = check_llm_provider.run_provider_test(
+        config_file=config_file,
+        task="minimal",
+        api_type="responses",
+    )
+
+    assert report.ok is True
+    assert report.http_status == 200
+    assert posted_urls == ["https://example.test/v1/responses"]
+    assert "input" in posted_payloads[0]
+    assert "messages" not in posted_payloads[0]
+    assert posted_payloads[0]["reasoning"] == {"effort": "low"}
+    assert posted_payloads[0]["text"]["format"] == {"type": "json_object"}
+    assert report.response_top_level_keys == ["output_text"]
+    assert report.choice_count == 0
 
 
 def test_provider_check_can_omit_response_format(tmp_path, monkeypatch):

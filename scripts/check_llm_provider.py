@@ -12,7 +12,15 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts import analyze_sentiment
-from scripts.analyze_content import DEFAULT_CONFIG_FILE, LLMConfig, chat_completions_url, load_config
+from scripts.analyze_content import (
+    DEFAULT_CONFIG_FILE,
+    LLMConfig,
+    build_headers,
+    extract_response_content,
+    llm_endpoint_url,
+    load_config,
+    normalize_api_type,
+)
 from scripts import analyze_content
 
 
@@ -60,6 +68,7 @@ def run_provider_test(
     model: str | None = None,
     reasoning_effort: str | None = None,
     response_format_type: str | None = None,
+    api_type: str | None = None,
     timeout: int = 60,
     preview_chars: int = DEFAULT_PREVIEW_CHARS,
     include_raw_response: bool = False,
@@ -70,16 +79,14 @@ def run_provider_test(
         model=model,
         reasoning_effort=reasoning_effort,
         response_format_type=response_format_type,
+        api_type=api_type,
     )
     payload = build_test_payload(task=task, comment=comment, config=config)
-    request_url = chat_completions_url(config.base_url)
+    request_url = llm_endpoint_url(config.base_url, config.api_type)
 
     response = requests.post(
         request_url,
-        headers={
-            "Authorization": f"Bearer {config.api_key}",
-            "Content-Type": "application/json",
-        },
+        headers=build_headers(config.api_key),
         json=payload,
         timeout=timeout,
     )
@@ -92,7 +99,7 @@ def run_provider_test(
 
     choice = first_choice(response_body)
     message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
-    content = message.get("content")
+    content = extract_content_for_report(response_body, config.api_type)
     content_text = content if isinstance(content, str) else ""
     content_json, content_json_error = parse_content_json(content_text)
     normalized_error = normalize_response_for_task(task, content_json) if content_json_error is None else "content is not JSON"
@@ -126,6 +133,7 @@ def override_config(
     model: str | None,
     reasoning_effort: str | None,
     response_format_type: str | None,
+    api_type: str | None,
 ) -> LLMConfig:
     return LLMConfig(
         base_url=base_url if base_url is not None else config.base_url,
@@ -135,48 +143,83 @@ def override_config(
         response_format_type=(
             response_format_type if response_format_type is not None else config.response_format_type
         ),
+        api_type=api_type if api_type is not None else config.api_type,
     )
 
 
 def build_test_payload(*, task: str, comment: str, config: LLMConfig) -> dict[str, Any]:
     if task == "content":
-        payload = analyze_content.build_payload(
+        payload = analyze_content.build_request_payload(
             analyze_content.CommentRecord("", "", comment, "", 0, "", "", ""),
             model=config.model,
             reasoning_effort=config.reasoning_effort,
             response_format_type=config.response_format_type,
+            api_type=config.api_type,
         )
         return maybe_remove_response_format(payload, config.response_format_type)
     if task == "sentiment":
-        payload = analyze_sentiment.build_payload(
+        payload = analyze_sentiment.build_request_payload(
             analyze_sentiment.CommentRecord("", "", comment, "", 0, "", "", ""),
             model=config.model,
             reasoning_effort=config.reasoning_effort,
             response_format_type=config.response_format_type,
+            api_type=config.api_type,
         )
         return maybe_remove_response_format(payload, config.response_format_type)
     if task == "minimal":
+        payload = build_minimal_payload(config)
+        return maybe_remove_response_format(payload, config.response_format_type)
+    raise ValueError(f"Unsupported task: {task}")
+
+
+def build_minimal_payload(config: LLMConfig) -> dict[str, Any]:
+    if normalize_api_type(config.api_type) == "responses":
         payload: dict[str, Any] = {
             "model": config.model,
             "temperature": 0,
-            "messages": [
+            "input": [
                 {"role": "system", "content": "Return only valid JSON. No Markdown."},
                 {"role": "user", "content": 'Return exactly this JSON object: {"ok": true, "note": "provider test"}'},
             ],
         }
         if config.reasoning_effort.strip():
-            payload["reasoning_effort"] = config.reasoning_effort.strip()
+            payload["reasoning"] = {"effort": config.reasoning_effort.strip()}
         response_format_type = config.response_format_type.strip()
         if response_format_type and response_format_type != "none":
-            payload["response_format"] = {"type": response_format_type}
+            payload["text"] = {"format": {"type": response_format_type}}
         return payload
-    raise ValueError(f"Unsupported task: {task}")
+
+    payload = {
+        "model": config.model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "Return only valid JSON. No Markdown."},
+            {"role": "user", "content": 'Return exactly this JSON object: {"ok": true, "note": "provider test"}'},
+        ],
+    }
+    if config.reasoning_effort.strip():
+        payload["reasoning_effort"] = config.reasoning_effort.strip()
+    response_format_type = config.response_format_type.strip()
+    if response_format_type and response_format_type != "none":
+        payload["response_format"] = {"type": response_format_type}
+    return payload
 
 
 def maybe_remove_response_format(payload: dict[str, Any], response_format_type: str) -> dict[str, Any]:
     if response_format_type.strip() == "none":
         payload.pop("response_format", None)
+        payload.pop("text", None)
     return payload
+
+
+def extract_content_for_report(response_body: dict[str, Any], api_type: str) -> str | None:
+    try:
+        return extract_response_content(response_body, api_type)
+    except Exception:
+        choice = first_choice(response_body)
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        content = message.get("content")
+        return content if isinstance(content, str) else None
 
 
 def safe_response_json(response: requests.Response) -> dict[str, Any]:
@@ -298,6 +341,12 @@ def main() -> None:
         default=None,
         help="Override config response_format_type. Use 'none' to omit response_format for minimal task.",
     )
+    parser.add_argument(
+        "--api-type",
+        choices=["chat_completions", "chat-completions", "responses"],
+        default=None,
+        help="Override config api_type. Use responses to call /responses instead of /chat/completions.",
+    )
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--preview-chars", type=int, default=DEFAULT_PREVIEW_CHARS)
     parser.add_argument("--show-raw", action="store_true")
@@ -311,6 +360,7 @@ def main() -> None:
         model=args.model,
         reasoning_effort=args.reasoning_effort,
         response_format_type=args.response_format_type,
+        api_type=args.api_type,
         timeout=args.timeout,
         preview_chars=args.preview_chars,
         include_raw_response=args.show_raw,
