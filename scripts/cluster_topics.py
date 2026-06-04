@@ -186,7 +186,13 @@ def create_topic_model(*, embedding_model: str, min_topic_size: int) -> TopicMod
     from sklearn.feature_extraction.text import CountVectorizer
     from umap import UMAP
 
-    sentence_model = SentenceTransformer(embedding_model)
+    try:
+        sentence_model = SentenceTransformer(embedding_model, local_files_only=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Embedding model {embedding_model!r} was not found in the offline cache. "
+            "Download/cache it before running BERTopic, or pass --embedding-model to a cached local path."
+        ) from exc
     vectorizer_model = CountVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=1)
     umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0, metric="cosine", random_state=42)
     hdbscan_model = HDBSCAN(

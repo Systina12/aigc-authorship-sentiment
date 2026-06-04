@@ -16,14 +16,17 @@ from dataloader import CommentRecord, DataLoader
 from scripts.analyze_content import (
     DEFAULT_CONFIG_FILE,
     LLMConfig,
+    ProgressReporter,
     build_headers,
-    build_responses_text_format,
+    build_payload as build_content_payload,
+    build_responses_payload as build_content_responses_payload,
     current_timestamp,
     extract_response_content,
     load_config,
     load_successful_record_hashes,
     llm_endpoint_url,
     normalize_api_type,
+    output_model,
     raise_for_status_with_body,
     record_hash,
     RESPONSES_API_TYPE,
@@ -99,6 +102,36 @@ SENTIMENT_SCHEMA: dict[str, Any] = {
     },
 }
 
+TOKEN_SAVING_SENTIMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["labels"],
+    "properties": {
+        "labels": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["category", "confidence"],
+                "properties": {
+                    "category": {"type": "string", "enum": list(SENTIMENT_CATEGORIES)},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+            },
+        },
+    },
+}
+
+TOKEN_SAVING_SYSTEM_PROMPT = (
+    "You are coding one Chinese comment for emotion and tone analysis. "
+    "Use only these categories:\n"
+    + "\n".join(f"- {category}" for category in SENTIMENT_CATEGORIES)
+    + "\nReturn strict JSON with labels only. "
+    "The labels field is required and must be an array. "
+    "Each label has category and confidence only. Use the fallback category when tone is unclear. "
+    "The fallback category is exclusive."
+)
+
 
 @dataclass(frozen=True)
 class SentimentAnalysisReport:
@@ -146,6 +179,8 @@ def analyze_sentiment(
 
         pending_records.append((record_index, record, current_record_hash))
 
+    progress = ProgressReporter("Sentiment analysis", total=len(pending_records), skipped=skipped_records)
+    progress.start()
     with output_path.open("a", encoding="utf-8", newline="\n") as output_stream:
         for output_row, is_error in iter_sentiment_analysis_rows(pending_records, llm_config):
             if is_error:
@@ -153,6 +188,8 @@ def analyze_sentiment(
             output_stream.write(json.dumps(output_row, ensure_ascii=False) + "\n")
             output_stream.flush()
             written_records += 1
+            progress.mark_result(is_error=is_error)
+    progress.finish()
 
     return SentimentAnalysisReport(
         loaded_records=len(records),
@@ -178,6 +215,7 @@ def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:
         reasoning_effort=config.reasoning_effort,
         response_format_type=config.response_format_type,
         api_type=config.api_type,
+        save_tokens=config.save_tokens,
     )
     response = requests.post(
         llm_endpoint_url(config.base_url, config.api_type),
@@ -191,7 +229,7 @@ def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:
     if not isinstance(content, str):
         raise ValueError("LLM response content is not a string")
 
-    return normalize_sentiment(json.loads(content))
+    return normalize_sentiment(json.loads(content), save_tokens=config.save_tokens)
 
 
 def iter_sentiment_analysis_rows(
@@ -221,11 +259,12 @@ def analyze_sentiment_row(
     record_hash_value: str,
     config: LLMConfig,
 ) -> tuple[dict[str, Any], bool]:
+    model_for_output = output_model(config)
     try:
         sentiment = analyze_record(record, config)
-        return build_success_row(record_index, record, record_hash_value, sentiment, config.model), False
+        return build_success_row(record_index, record, record_hash_value, sentiment, model_for_output), False
     except Exception as exc:  # noqa: BLE001 - batch jobs must preserve per-record failures.
-        return build_error_row(record_index, record, record_hash_value, exc, config.model), True
+        return build_error_row(record_index, record, record_hash_value, exc, model_for_output), True
 
 
 def build_request_payload(
@@ -235,19 +274,23 @@ def build_request_payload(
     reasoning_effort: str = "",
     response_format_type: str = "json_object",
     api_type: str = "",
+    save_tokens: bool = False,
 ) -> dict[str, Any]:
+    effective_reasoning_effort = "" if save_tokens else reasoning_effort
     if normalize_api_type(api_type) == RESPONSES_API_TYPE:
         return build_responses_payload(
             record,
             model=model,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=effective_reasoning_effort,
             response_format_type=response_format_type,
+            save_tokens=save_tokens,
         )
     return build_payload(
         record,
         model=model,
-        reasoning_effort=reasoning_effort,
+        reasoning_effort=effective_reasoning_effort,
         response_format_type=response_format_type,
+        save_tokens=save_tokens,
     )
 
 
@@ -257,32 +300,18 @@ def build_payload(
     model: str,
     reasoning_effort: str = "",
     response_format_type: str = "json_object",
+    save_tokens: bool = False,
 ) -> dict[str, Any]:
-    payload = {
-        "model": model,
-        "temperature": 0.1,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"评论内容：{record.content}"},
-        ],
-    }
-    if reasoning_effort.strip():
-        payload["reasoning_effort"] = reasoning_effort.strip()
-
-    response_format_type = response_format_type.strip() or "json_object"
-    if response_format_type == "json_schema":
-        payload["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "sentiment_analysis",
-                "schema": SENTIMENT_SCHEMA,
-                "strict": True,
-            },
-        }
-    elif response_format_type != "none":
-        payload["response_format"] = {"type": response_format_type}
-
-    return payload
+    return build_content_payload(
+        record,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        response_format_type=response_format_type,
+        system_prompt=sentiment_system_prompt(save_tokens=save_tokens),
+        schema=sentiment_schema(save_tokens=save_tokens),
+        schema_name="sentiment_analysis",
+        save_tokens=save_tokens,
+    )
 
 
 def build_responses_payload(
@@ -291,33 +320,34 @@ def build_responses_payload(
     model: str,
     reasoning_effort: str = "",
     response_format_type: str = "json_object",
+    save_tokens: bool = False,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "model": model,
-        "temperature": 0.1,
-        "input": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Return only valid json. No Markdown.\nComment content:\n{record.content}",
-            },
-        ],
-    }
-    if reasoning_effort.strip():
-        payload["reasoning"] = {"effort": reasoning_effort.strip()}
-
-    text_format = build_responses_text_format(
+    return build_content_responses_payload(
+        record,
+        model=model,
+        reasoning_effort=reasoning_effort,
         response_format_type=response_format_type,
+        system_prompt=sentiment_system_prompt(save_tokens=save_tokens),
+        schema=sentiment_schema(save_tokens=save_tokens),
         schema_name="sentiment_analysis",
-        schema=SENTIMENT_SCHEMA,
+        save_tokens=save_tokens,
     )
-    if text_format is not None:
-        payload["text"] = {"format": text_format}
-
-    return payload
 
 
-def normalize_sentiment(sentiment: dict[str, Any]) -> dict[str, Any]:
+
+def sentiment_system_prompt(*, save_tokens: bool) -> str:
+    if save_tokens:
+        return TOKEN_SAVING_SYSTEM_PROMPT
+    return SYSTEM_PROMPT
+
+
+def sentiment_schema(*, save_tokens: bool) -> dict[str, Any]:
+    if save_tokens:
+        return TOKEN_SAVING_SENTIMENT_SCHEMA
+    return SENTIMENT_SCHEMA
+
+
+def normalize_sentiment(sentiment: dict[str, Any], *, save_tokens: bool = False) -> dict[str, Any]:
     top_level_rationale = sentiment.get("rationale")
     summary = sentiment.get("summary")
     labels = sentiment.get("labels")
@@ -326,13 +356,13 @@ def normalize_sentiment(sentiment: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(labels, list):
         raise ValueError("LLM sentiment is missing list field: labels")
 
-    normalized_labels = normalize_labels(labels, top_level_rationale=top_level_rationale)
+    normalized_labels = normalize_labels(labels, top_level_rationale=top_level_rationale, save_tokens=save_tokens)
     if not normalized_labels:
         normalized_labels = [
             {
                 "category": FALLBACK_CATEGORY,
                 "confidence": 0.5,
-                "rationale": "模型未返回明确情绪或语气标签。",
+                "rationale": "" if save_tokens else "模型未返回明确情绪或语气标签。",
             }
         ]
 
@@ -355,14 +385,16 @@ def normalize_sentiment(sentiment: dict[str, Any]) -> dict[str, Any]:
         sentiment_polarity = "neutral"
 
     return {
-        "summary": summary,
+        "summary": "" if save_tokens else summary,
         "dominant_category": dominant_category,
         "sentiment_polarity": sentiment_polarity,
         "labels": normalized_labels,
     }
 
 
-def normalize_labels(labels: list[Any], *, top_level_rationale: object) -> list[dict[str, Any]]:
+def normalize_labels(
+    labels: list[Any], *, top_level_rationale: object, save_tokens: bool = False
+) -> list[dict[str, Any]]:
     normalized_labels: list[dict[str, Any]] = []
     seen_categories: set[str] = set()
     for label in labels:
@@ -382,7 +414,9 @@ def normalize_labels(labels: list[Any], *, top_level_rationale: object) -> list[
             raise ValueError(f"LLM returned invalid confidence for {category}: {confidence!r}")
 
         rationale = label.get("rationale")
-        if not isinstance(rationale, str):
+        if save_tokens:
+            rationale = ""
+        elif not isinstance(rationale, str):
             rationale = top_level_rationale if isinstance(top_level_rationale, str) else ""
 
         seen_categories.add(category)
@@ -399,12 +433,12 @@ def normalize_labels(labels: list[Any], *, top_level_rationale: object) -> list[
 
 def infer_polarity(dominant_category: str, labels: list[dict[str, Any]]) -> str:
     categories = {label["category"] for label in labels}
+    if "乐观" in categories and categories - {"乐观", FALLBACK_CATEGORY}:
+        return "mixed"
     if dominant_category == "乐观":
         return "positive"
     if dominant_category == FALLBACK_CATEGORY:
         return "neutral"
-    if "乐观" in categories and categories - {"乐观", FALLBACK_CATEGORY}:
-        return "mixed"
     return "negative"
 
 

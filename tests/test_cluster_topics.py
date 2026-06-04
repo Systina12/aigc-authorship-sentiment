@@ -1,10 +1,12 @@
 import csv
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
-from scripts.cluster_topics import cluster_topics
+from scripts.cluster_topics import create_topic_model, cluster_topics
 
 
 class FakeTopicModel:
@@ -138,6 +140,26 @@ def test_cluster_topics_validates_parameters(tmp_path):
         cluster_topics(input_file=input_file, output_dir=tmp_path / "out", min_topic_size=1, topic_model=FakeTopicModel())
 
 
+def test_create_topic_model_loads_sentence_transformer_from_offline_cache(monkeypatch):
+    calls = {}
+    install_fake_topic_dependencies(monkeypatch, calls)
+
+    create_topic_model(embedding_model="cached-model", min_topic_size=2)
+
+    assert calls["sentence_transformer"] == {
+        "model_name_or_path": "cached-model",
+        "local_files_only": True,
+    }
+
+
+def test_create_topic_model_reports_missing_offline_embedding_cache(monkeypatch):
+    calls = {}
+    install_fake_topic_dependencies(monkeypatch, calls, sentence_transformer_error=OSError("not cached"))
+
+    with pytest.raises(RuntimeError, match="cached-model.*offline cache"):
+        create_topic_model(embedding_model="cached-model", min_topic_size=2)
+
+
 def write_comment_csv(path, contents):
     with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.DictWriter(
@@ -167,3 +189,42 @@ def read_csv(path):
 
 def read_jsonl(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def install_fake_topic_dependencies(monkeypatch, calls, sentence_transformer_error=None):
+    class FakeBERTopic:
+        def __init__(self, **kwargs):
+            calls["bertopic"] = kwargs
+
+    class FakeHDBSCAN:
+        def __init__(self, **kwargs):
+            calls["hdbscan"] = kwargs
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name_or_path, *, local_files_only=False, **kwargs):
+            calls["sentence_transformer"] = {
+                "model_name_or_path": model_name_or_path,
+                "local_files_only": local_files_only,
+            }
+            if sentence_transformer_error is not None:
+                raise sentence_transformer_error
+
+    class FakeCountVectorizer:
+        def __init__(self, **kwargs):
+            calls["vectorizer"] = kwargs
+
+    class FakeUMAP:
+        def __init__(self, **kwargs):
+            calls["umap"] = kwargs
+
+    fake_modules = {
+        "bertopic": types.SimpleNamespace(BERTopic=FakeBERTopic),
+        "hdbscan": types.SimpleNamespace(HDBSCAN=FakeHDBSCAN),
+        "sentence_transformers": types.SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+        "sklearn": types.SimpleNamespace(),
+        "sklearn.feature_extraction": types.SimpleNamespace(),
+        "sklearn.feature_extraction.text": types.SimpleNamespace(CountVectorizer=FakeCountVectorizer),
+        "umap": types.SimpleNamespace(UMAP=FakeUMAP),
+    }
+    for module_name, module in fake_modules.items():
+        monkeypatch.setitem(sys.modules, module_name, module)

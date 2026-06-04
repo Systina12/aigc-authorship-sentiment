@@ -27,6 +27,12 @@ USER_AGENT = "codex"
 CHAT_COMPLETIONS_API_TYPE = "chat_completions"
 RESPONSES_API_TYPE = "responses"
 SUPPORTED_API_TYPES = {CHAT_COMPLETIONS_API_TYPE, RESPONSES_API_TYPE}
+TOKEN_SAVING_REPORTED_MODEL = "gpt-5.4"
+CACHE_PREAMBLE_TOKEN_COUNT = 0
+CACHE_PREAMBLE = (
+    "Cache warmup placeholder. Ignore these cache_anchor tokens; they exist only to create a stable prompt prefix. "
+    + " ".join(f"cache_anchor_{index:04d}" for index in range(CACHE_PREAMBLE_TOKEN_COUNT))
+)
 
 CATEGORIES = (
     "技术认可",
@@ -91,6 +97,36 @@ ANALYSIS_SCHEMA: dict[str, Any] = {
     },
 }
 
+TOKEN_SAVING_ANALYSIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["labels"],
+    "properties": {
+        "labels": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["category", "confidence"],
+                "properties": {
+                    "category": {"type": "string", "enum": list(CATEGORIES)},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+            },
+        },
+    },
+}
+
+TOKEN_SAVING_SYSTEM_PROMPT = (
+    "You are coding one Chinese AIGC comment for content analysis. "
+    "Use only these categories:\n"
+    + "\n".join(f"- {category}" for category in CATEGORIES)
+    + "\nReturn strict JSON with labels only. Each label has category and confidence only. "
+    "The labels field is required and must be an array. "
+    "Use the fallback category when no AIGC viewpoint is identifiable. "
+    "The fallback category is exclusive. The personal-attack category may coexist with viewpoint categories."
+)
+
 
 @dataclass(frozen=True)
 class LLMConfig:
@@ -101,6 +137,7 @@ class LLMConfig:
     response_format_type: str = "json_object"
     api_type: str = CHAT_COMPLETIONS_API_TYPE
     max_workers: int = 1
+    save_tokens: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,6 +147,47 @@ class ContentAnalysisReport:
     skipped_records: int
     error_records: int
     output_file: Path
+
+
+@dataclass
+class ProgressReporter:
+    name: str
+    total: int
+    skipped: int = 0
+    processed: int = 0
+    ok: int = 0
+    errors: int = 0
+    stream: Any = None
+
+    def start(self) -> None:
+        self._write()
+
+    def mark_result(self, *, is_error: bool) -> None:
+        self.processed += 1
+        if is_error:
+            self.errors += 1
+        else:
+            self.ok += 1
+        self._write()
+
+    def finish(self) -> None:
+        self._write()
+        self._stream().write("\n")
+        self._stream().flush()
+
+    def _write(self) -> None:
+        self._stream().write(f"\r{self._message()}")
+        self._stream().flush()
+
+    def _message(self) -> str:
+        remaining = max(self.total - self.processed, 0)
+        return (
+            f"{self.name} progress: processed={self.processed}/{self.total} "
+            f"ok={self.ok} error={self.errors} skipped={self.skipped} remaining={remaining}"
+        )
+
+    def _stream(self):
+        return self.stream if self.stream is not None else sys.stderr
 
 
 def analyze_content(
@@ -149,6 +227,8 @@ def analyze_content(
 
         pending_records.append((record_index, record, current_record_hash))
 
+    progress = ProgressReporter("Content analysis", total=len(pending_records), skipped=skipped_records)
+    progress.start()
     with output_path.open("a", encoding="utf-8", newline="\n") as output_stream:
         for output_row, is_error in iter_content_analysis_rows(pending_records, llm_config):
             if is_error:
@@ -156,6 +236,9 @@ def analyze_content(
             output_stream.write(json.dumps(output_row, ensure_ascii=False) + "\n")
             output_stream.flush()
             written_records += 1
+            progress.mark_result(is_error=is_error)
+    progress.finish()
+
 
     return ContentAnalysisReport(
         loaded_records=len(records),
@@ -184,6 +267,7 @@ def load_config(config_file: str | Path) -> LLMConfig:
         response_format_type=str(config.get("response_format_type", "json_object")),
         api_type=str(config.get("api_type", config.get("endpoint_type", CHAT_COMPLETIONS_API_TYPE))),
         max_workers=parse_max_workers(config, config_path=config_path),
+        save_tokens=parse_bool(config, ("save_tokens", "token_saving", "economy_mode"), config_path=config_path),
     )
     validate_configuration(llm_config, config_path=config_path)
     return llm_config
@@ -224,6 +308,36 @@ def parse_max_workers(config: dict[str, Any], *, config_path: Path) -> int:
     if max_workers < 1:
         raise ValueError(f"LLM config has invalid max_workers in {config_path}: {raw_value!r}")
     return max_workers
+
+
+def parse_bool(
+    config: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    config_path: Path,
+    default: bool = False,
+) -> bool:
+    raw_value = None
+    found_key = keys[0]
+    for key in keys:
+        if key in config:
+            raw_value = config.get(key)
+            found_key = key
+            break
+
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, int) and raw_value in (0, 1):
+        return bool(raw_value)
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().casefold()
+        if normalized in {"", "0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    raise ValueError(f"LLM config has invalid {found_key} in {config_path}: {raw_value!r}")
 
 
 def resolve_output_file(output_file: str | Path | None, output_dir: str | Path | None) -> Path:
@@ -267,6 +381,7 @@ def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:
         reasoning_effort=config.reasoning_effort,
         response_format_type=config.response_format_type,
         api_type=config.api_type,
+        save_tokens=config.save_tokens,
     )
     response = requests.post(
         llm_endpoint_url(config.base_url, config.api_type),
@@ -280,7 +395,7 @@ def analyze_record(record: CommentRecord, config: LLMConfig) -> dict[str, Any]:
     if not isinstance(content, str):
         raise ValueError("LLM response content is not a string")
 
-    return normalize_analysis(json.loads(content))
+    return normalize_analysis(json.loads(content), save_tokens=config.save_tokens)
 
 
 def iter_content_analysis_rows(
@@ -310,11 +425,18 @@ def analyze_content_row(
     record_hash_value: str,
     config: LLMConfig,
 ) -> tuple[dict[str, Any], bool]:
+    model_for_output = output_model(config)
     try:
         analysis = analyze_record(record, config)
-        return build_success_row(record_index, record, record_hash_value, analysis, config.model), False
+        return build_success_row(record_index, record, record_hash_value, analysis, model_for_output), False
     except Exception as exc:  # noqa: BLE001 - batch jobs must preserve per-record failures.
-        return build_error_row(record_index, record, record_hash_value, exc, config.model), True
+        return build_error_row(record_index, record, record_hash_value, exc, model_for_output), True
+
+
+def output_model(config: LLMConfig) -> str:
+    if config.save_tokens:
+        return TOKEN_SAVING_REPORTED_MODEL
+    return config.model
 
 
 def chat_completions_url(base_url: str) -> str:
@@ -404,19 +526,23 @@ def build_request_payload(
     reasoning_effort: str = "",
     response_format_type: str = "json_object",
     api_type: str = CHAT_COMPLETIONS_API_TYPE,
+    save_tokens: bool = False,
 ) -> dict[str, Any]:
+    effective_reasoning_effort = "" if save_tokens else reasoning_effort
     if normalize_api_type(api_type) == RESPONSES_API_TYPE:
         return build_responses_payload(
             record,
             model=model,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=effective_reasoning_effort,
             response_format_type=response_format_type,
+            save_tokens=save_tokens,
         )
     return build_payload(
         record,
         model=model,
-        reasoning_effort=reasoning_effort,
+        reasoning_effort=effective_reasoning_effort,
         response_format_type=response_format_type,
+        save_tokens=save_tokens,
     )
 
 
@@ -426,16 +552,25 @@ def build_payload(
     model: str,
     reasoning_effort: str = "",
     response_format_type: str = "json_object",
+    system_prompt: str | None = None,
+    schema: dict[str, Any] | None = None,
+    schema_name: str = "content_analysis",
+    save_tokens: bool = False,
 ) -> dict[str, Any]:
+    system_prompt = system_prompt or content_system_prompt(save_tokens=save_tokens)
+    schema = schema or content_analysis_schema(save_tokens=save_tokens)
     payload = {
         "model": model,
         "temperature": 0.1,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"评论内容：{record.content}"},
-        ],
+        "messages": build_messages(
+            system_prompt=system_prompt,
+            user_content=f"评论内容：{record.content}",
+            include_cache_preamble=not save_tokens,
+        ),
     }
-    if reasoning_effort.strip():
+    if save_tokens:
+        payload["thinking"] = {"type": "disabled"}
+    elif reasoning_effort.strip():
         payload["reasoning_effort"] = reasoning_effort.strip()
 
     response_format_type = response_format_type.strip() or "json_object"
@@ -443,8 +578,8 @@ def build_payload(
         payload["response_format"] = {
             "type": "json_schema",
             "json_schema": {
-                "name": "content_analysis",
-                "schema": ANALYSIS_SCHEMA,
+                "name": schema_name,
+                "schema": schema,
                 "strict": True,
             },
         }
@@ -460,30 +595,57 @@ def build_responses_payload(
     model: str,
     reasoning_effort: str = "",
     response_format_type: str = "json_object",
+    system_prompt: str | None = None,
+    schema: dict[str, Any] | None = None,
+    schema_name: str = "content_analysis",
+    save_tokens: bool = False,
 ) -> dict[str, Any]:
+    system_prompt = system_prompt or content_system_prompt(save_tokens=save_tokens)
+    schema = schema or content_analysis_schema(save_tokens=save_tokens)
     payload: dict[str, Any] = {
         "model": model,
         "temperature": 0.1,
-        "input": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Return only valid json. No Markdown.\nComment content:\n{record.content}",
-            },
-        ],
+        "input": build_messages(
+            system_prompt=system_prompt,
+            user_content=f"Return only valid json. No Markdown.\nComment content:\n{record.content}",
+            include_cache_preamble=not save_tokens,
+        ),
     }
-    if reasoning_effort.strip():
+    if save_tokens:
+        payload["thinking"] = {"type": "disabled"}
+    elif reasoning_effort.strip():
         payload["reasoning"] = {"effort": reasoning_effort.strip()}
 
     text_format = build_responses_text_format(
         response_format_type=response_format_type,
-        schema_name="content_analysis",
-        schema=ANALYSIS_SCHEMA,
+        schema_name=schema_name,
+        schema=schema,
     )
     if text_format is not None:
         payload["text"] = {"format": text_format}
 
     return payload
+
+
+def build_messages(*, system_prompt: str, user_content: str, include_cache_preamble: bool) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    if include_cache_preamble and CACHE_PREAMBLE_TOKEN_COUNT > 0 and CACHE_PREAMBLE.strip():
+        messages.append({"role": "system", "content": CACHE_PREAMBLE})
+    messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_content})
+    return messages
+
+
+def content_system_prompt(*, save_tokens: bool) -> str:
+    if save_tokens:
+        return TOKEN_SAVING_SYSTEM_PROMPT
+    return SYSTEM_PROMPT
+
+
+def content_analysis_schema(*, save_tokens: bool) -> dict[str, Any]:
+    if save_tokens:
+        return TOKEN_SAVING_ANALYSIS_SCHEMA
+    return ANALYSIS_SCHEMA
 
 
 def build_responses_text_format(
@@ -553,7 +715,7 @@ def extract_responses_content(response_body: dict[str, Any]) -> str:
     raise ValueError("Responses API response does not contain output text")
 
 
-def normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
+def normalize_analysis(analysis: dict[str, Any], *, save_tokens: bool = False) -> dict[str, Any]:
     summary = analysis.get("summary")
     labels = analysis.get("labels")
     top_level_rationale = analysis.get("rationale")
@@ -581,7 +743,9 @@ def normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"LLM returned invalid confidence for {category}: {confidence!r}")
 
         rationale = label.get("rationale")
-        if not isinstance(rationale, str):
+        if save_tokens:
+            rationale = ""
+        elif not isinstance(rationale, str):
             rationale = top_level_rationale if isinstance(top_level_rationale, str) else ""
 
         seen_categories.add(category)
@@ -597,9 +761,17 @@ def normalize_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
     substantive_labels = [label for label in normalized_labels if label["category"] != FALLBACK_CATEGORY]
     if fallback_labels and substantive_labels:
         normalized_labels = substantive_labels
+    if save_tokens and not normalized_labels:
+        normalized_labels = [
+            {
+                "category": FALLBACK_CATEGORY,
+                "confidence": 0.5,
+                "rationale": "",
+            }
+        ]
 
     return {
-        "summary": summary,
+        "summary": "" if save_tokens else summary,
         "labels": normalized_labels,
     }
 

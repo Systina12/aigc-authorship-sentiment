@@ -107,6 +107,8 @@ def test_analyze_content_respects_limit_and_writes_multilabel_jsonl(tmp_path, mo
     assert posted_payloads[0]["reasoning_effort"] == REASONING_EFFORT
     assert posted_payloads[0]["response_format"] == {"type": RESPONSE_FORMAT_TYPE}
     assert [label["category"] for label in rows[0]["analysis"]["labels"]] == ["工具化认知", "版权争议"]
+    assert len(posted_payloads[0]["messages"]) == 2
+    assert posted_payloads[0]["messages"][0]["content"] == content_analysis.SYSTEM_PROMPT
     assert posted_payloads[0]["messages"][1]["content"] == "评论内容：AI 工具能提高效率，但版权也要管"
     assert "这会让画师失业" not in posted_payloads[0]["messages"][1]["content"]
 
@@ -174,6 +176,87 @@ def test_analyze_content_accepts_top_level_rationale_response(tmp_path, monkeypa
     assert rows[0]["status"] == "ok"
     assert rows[0]["analysis"]["summary"] == "评论提及 AI 裁员潮，表达对就业影响的关注。"
     assert rows[0]["analysis"]["labels"][0]["rationale"] == "评论提及 AI 裁员潮，表达对就业影响的关注。"
+
+
+def test_analyze_content_save_tokens_omits_preamble_reasoning_and_reason_output(tmp_path, monkeypatch):
+    input_file = tmp_path / "comments_cleaned.csv"
+    output_file = tmp_path / "comment_labels.jsonl"
+    config_file = write_config(
+        tmp_path,
+        model="upstream-model",
+        response_format_type="json_schema",
+        save_tokens=True,
+    )
+    write_comment_csv(input_file, ["AI 工具确实省事，但是版权风险也明显"])
+    posted_payloads = []
+
+    def fake_post(url, headers, json, timeout):
+        posted_payloads.append(json)
+        return FakeResponse(
+            json_dumps(
+                {
+                    "summary": "认可工具效率并提到版权风险。",
+                    "labels": [
+                        {"category": "工具化认知", "confidence": 0.9, "rationale": "模型仍返回了依据"},
+                        {"category": "版权争议", "confidence": 0.8, "rationale": "模型仍返回了依据"},
+                    ],
+                }
+            )
+        )
+
+    monkeypatch.setattr(content_analysis.requests, "post", fake_post)
+
+    content_analysis.analyze_content(
+        input_file=input_file,
+        output_file=output_file,
+        config_file=config_file,
+    )
+
+    rows = read_jsonl(output_file)
+    payload = posted_payloads[0]
+    messages = payload["messages"]
+    response_schema = payload["response_format"]["json_schema"]["schema"]
+    label_schema = response_schema["properties"]["labels"]["items"]
+
+    assert "reasoning_effort" not in payload
+    assert payload["thinking"] == {"type": "disabled"}
+    assert all("cache_anchor_" not in message["content"] for message in messages)
+    assert len(messages) == 2
+    assert messages[0]["content"] != content_analysis.SYSTEM_PROMPT
+    assert "summary" not in messages[0]["content"]
+    assert "rationale" not in messages[0]["content"]
+    assert "summary" not in response_schema["required"]
+    assert "summary" not in response_schema["properties"]
+    assert "rationale" not in label_schema["required"]
+    assert "rationale" not in label_schema["properties"]
+    assert rows[0]["llm"]["model"] == "gpt-5.4"
+    assert rows[0]["analysis"]["summary"] == ""
+    assert [label["rationale"] for label in rows[0]["analysis"]["labels"]] == ["", ""]
+
+
+def test_analyze_content_save_tokens_writes_error_when_labels_missing(tmp_path, monkeypatch):
+    input_file = tmp_path / "comments_cleaned.csv"
+    output_file = tmp_path / "comment_labels.jsonl"
+    config_file = write_config(tmp_path, save_tokens=True)
+    write_comment_csv(input_file, ["我那可没这么高级"])
+
+    def fake_post(url, headers, json, timeout):
+        return FakeResponse(json_dumps({"summary": "模型只返回了摘要"}))
+
+    monkeypatch.setattr(content_analysis.requests, "post", fake_post)
+
+    content_analysis.analyze_content(
+        input_file=input_file,
+        output_file=output_file,
+        config_file=config_file,
+    )
+
+    rows = read_jsonl(output_file)
+
+    assert rows[0]["status"] == "error"
+    assert rows[0]["analysis"] is None
+    assert rows[0]["error_type"] == "ValueError"
+    assert rows[0]["error_message"] == "LLM analysis is missing list field: labels"
 
 
 def test_analyze_content_writes_errors_and_continues(tmp_path, monkeypatch):
@@ -415,6 +498,8 @@ def test_analyze_content_supports_responses_api_output_text(tmp_path, monkeypatc
     assert posted_urls == [f"{BASE_URL}/responses"]
     assert "input" in posted_payloads[0]
     assert "messages" not in posted_payloads[0]
+    assert len(posted_payloads[0]["input"]) == 2
+    assert posted_payloads[0]["input"][0]["content"] == content_analysis.SYSTEM_PROMPT
     assert posted_payloads[0]["input"][1]["content"] == (
         "Return only valid json. No Markdown.\nComment content:\nAI helps with repetitive drawing work"
     )
@@ -460,6 +545,47 @@ def test_analyze_content_uses_configured_max_workers(tmp_path, monkeypatch):
     assert max_active_requests == 2
     assert sorted(row["record_index"] for row in rows) == [0, 1]
     assert all(row["status"] == "ok" for row in rows)
+
+
+def test_analyze_content_prints_progress_counts(tmp_path, monkeypatch, capsys):
+    input_file = tmp_path / "comments_cleaned.csv"
+    output_file = tmp_path / "comment_labels.jsonl"
+    config_file = write_config(tmp_path)
+    write_comment_csv(input_file, ["already ok", "will fail", "will pass"])
+    ok_record = record_dict("already ok")
+    output_file.write_text(
+        json_dumps(
+            {
+                "record_index": 0,
+                "record_hash": content_analysis.record_dict_hash(ok_record),
+                "record": ok_record,
+                "status": "ok",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    calls = 0
+
+    def fake_post(url, headers, json, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary failure")
+        return FakeResponse(success_response())
+
+    monkeypatch.setattr(content_analysis.requests, "post", fake_post)
+
+    content_analysis.analyze_content(input_file=input_file, output_file=output_file, config_file=config_file)
+
+    progress_output = capsys.readouterr().err
+
+    assert "Content analysis progress" in progress_output
+    assert "processed=2/2" in progress_output
+    assert "ok=1" in progress_output
+    assert "error=1" in progress_output
+    assert "skipped=1" in progress_output
+    assert "remaining=0" in progress_output
 
 
 def test_analyze_content_requires_positive_max_workers(tmp_path):

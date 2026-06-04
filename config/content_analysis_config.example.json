@@ -4,5 +4,6 @@
   "model": "deepseek-v4-pro",
   "reasoning_effort": "max",
   "response_format_type": "json_object",
-  "max_workers": 4
+  "max_workers": 4,
+  "save_tokens": true
 }
