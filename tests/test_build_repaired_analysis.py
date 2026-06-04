@@ -4,6 +4,7 @@ from pathlib import Path
 
 from scripts.analyze_content import record_dict_hash
 from scripts.build_repaired_analysis import build_repaired_analysis
+from scripts.plot_repaired_crosstabs import build_repaired_crosstab_charts
 
 
 LAST_CLEANED_HASHES_BY_INDEX = {}
@@ -130,6 +131,8 @@ def test_build_repaired_analysis_repairs_core_outputs_without_raw_or_x10_labels(
         "core_content_label_distribution.png",
         "core_sentiment_label_distribution.png",
         "core_polarity_distribution.png",
+        "core_content_sentiment_crosstab_heatmap.png",
+        "core_content_polarity_crosstab_heatmap.png",
         "core_wordcloud.png",
         "core_topic_distribution.png",
         "data_quality_summary_table.png",
@@ -142,6 +145,36 @@ def test_build_repaired_analysis_repairs_core_outputs_without_raw_or_x10_labels(
     for name in figure_names:
         assert_clean_text(name)
     assert metadata["quality_metrics"]["core_opinion_records"] == 2
+
+
+def test_build_repaired_crosstab_charts_runs_without_repair_pipeline(tmp_path):
+    tables_dir = tmp_path / "tables"
+    figures_dir = tmp_path / "figures"
+    write_dict_csv(
+        tables_dir / "core_content_sentiment_crosstab.csv",
+        [
+            {"content_label": "技术认可", "乐观_count": 20, "焦虑_count": 0},
+            {"content_label": "版权争议", "乐观_count": 0, "焦虑_count": 10},
+        ],
+    )
+    write_dict_csv(
+        tables_dir / "core_content_polarity_crosstab.csv",
+        [
+            {"content_label": "技术认可", "positive_count": 20, "negative_count": 0},
+            {"content_label": "版权争议", "positive_count": 0, "negative_count": 10},
+        ],
+    )
+
+    figures = build_repaired_crosstab_charts(tables_dir=tables_dir, figures_dir=figures_dir, top_n=20)
+
+    assert set(figures) == {
+        "core_content_sentiment_crosstab_heatmap.png",
+        "core_content_polarity_crosstab_heatmap.png",
+    }
+    for path in figures.values():
+        assert path.exists()
+        assert path.stat().st_size > 0
+        assert_clean_text(path.name)
 
 
 def test_build_repaired_analysis_prefers_ok_entries_over_later_errors(tmp_path):
@@ -291,6 +324,14 @@ def write_jsonl(path, rows):
     with path.open("w", encoding="utf-8", newline="\n") as jsonl_file:
         for row in rows:
             jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def write_dict_csv(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def read_csv(path):

@@ -368,6 +368,8 @@ def cleanup_outputs(output_dir: Path) -> None:
         "figures/core_content_label_distribution.png",
         "figures/core_sentiment_label_distribution.png",
         "figures/core_polarity_distribution.png",
+        "figures/core_content_sentiment_crosstab_heatmap.png",
+        "figures/core_content_polarity_crosstab_heatmap.png",
         "figures/core_wordcloud.png",
         "figures/core_topic_distribution.png",
         "figures/data_quality_summary_table.png",
@@ -1015,6 +1017,7 @@ def write_figures(
     plot_bar(read_table(tables_dir / "core_sentiment_label_summary.csv"), "category", "count", "Core Sentiment Labels", figures["core_sentiment_label_distribution.png"], top_n)
     plot_bar(read_table(tables_dir / "core_polarity_summary.csv"), "polarity", "count", "Core Polarity", figures["core_polarity_distribution.png"], top_n)
     plot_wordcloud(read_table(tables_dir / "core_word_frequency.csv"), figures["core_wordcloud.png"])
+    figures.update(write_crosstab_heatmap_figures(tables_dir=tables_dir, figures_dir=figures_dir, top_n=top_n))
     if topic_summary_rows:
         topic_figure = figures_dir / "core_topic_distribution.png"
         plot_bar(read_table(tables_dir / "core_topic_summary.csv"), "topic_label", "count", "Core Topics", topic_figure, top_n)
@@ -1043,6 +1046,94 @@ def plot_bar(table: pd.DataFrame, label_col: str, value_col: str, title: str, ou
     plt.title(title)
     plt.tight_layout()
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_file, dpi=160)
+    plt.close()
+
+
+def write_crosstab_heatmap_figures(*, tables_dir: Path, figures_dir: Path, top_n: int) -> dict[str, Path]:
+    configure_matplotlib_font()
+    specs = [
+        (
+            "core_content_sentiment_crosstab.csv",
+            "core_content_sentiment_crosstab_heatmap.png",
+            "Core Content Sentiment Crosstab",
+        ),
+        (
+            "core_content_polarity_crosstab.csv",
+            "core_content_polarity_crosstab_heatmap.png",
+            "Core Content Polarity Crosstab",
+        ),
+    ]
+    figures: dict[str, Path] = {}
+    for table_name, figure_name, title in specs:
+        figure_path = figures_dir / figure_name
+        plot_crosstab_heatmap(
+            read_table(tables_dir / table_name),
+            row_col="content_label",
+            title=title,
+            output_file=figure_path,
+            top_n=top_n,
+        )
+        figures[figure_name] = figure_path
+    return figures
+
+
+def plot_crosstab_heatmap(
+    table: pd.DataFrame,
+    *,
+    row_col: str,
+    title: str,
+    output_file: Path,
+    top_n: int,
+) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    if table.empty or row_col not in table or len(table.columns) <= 1:
+        write_placeholder_figure(output_file, title, "No data")
+        return
+
+    value_columns = [column for column in table.columns if column != row_col]
+    numeric_values = table[value_columns].apply(pd.to_numeric, errors="coerce").fillna(0)
+    if numeric_values.empty:
+        write_placeholder_figure(output_file, title, "No data")
+        return
+
+    row_order = numeric_values.sum(axis=1).sort_values(ascending=False).head(top_n).index
+    column_order = numeric_values.sum(axis=0).sort_values(ascending=False).head(top_n).index.tolist()
+    matrix = numeric_values.loc[row_order, column_order].to_numpy()
+    if matrix.size == 0:
+        write_placeholder_figure(output_file, title, "No data")
+        return
+
+    row_labels = [shorten_label(str(value), 24) for value in table.loc[row_order, row_col].tolist()]
+    column_labels = [shorten_label(clean_crosstab_axis_label(column), 18) for column in column_order]
+    width = max(8, min(18, len(column_labels) * 1.05 + 4))
+    height = max(5, min(16, len(row_labels) * 0.45 + 2))
+    plt.figure(figsize=(width, height))
+    plt.imshow(matrix, aspect="auto", cmap="YlGnBu")
+    plt.colorbar(label="Count")
+    plt.xticks(range(len(column_labels)), column_labels, rotation=45, ha="right")
+    plt.yticks(range(len(row_labels)), row_labels)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=160)
+    plt.close()
+
+
+def clean_crosstab_axis_label(column: str) -> str:
+    return str(column).removesuffix("_count")
+
+
+def shorten_label(value: str, max_length: int) -> str:
+    return value if len(value) <= max_length else f"{value[: max_length - 3]}..."
+
+
+def write_placeholder_figure(output_file: Path, title: str, message: str) -> None:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(8, 4))
+    plt.text(0.5, 0.5, message, ha="center", va="center")
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
     plt.savefig(output_file, dpi=160)
     plt.close()
 
